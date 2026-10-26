@@ -11,6 +11,28 @@ import numpy as np
 from sklearn.cluster import KMeans
 from omegaconf import OmegaConf
 import os
+import time
+import logging
+from utils.expert_io import MoEPager
+
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    handlers=[
+        logging.FileHandler('expert_init.log', mode='w'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.cluster import KMeans
+from omegaconf import OmegaConf
+import os
 from utils.expert_io import MoEPager
 
 
@@ -27,7 +49,7 @@ def init_experts_from_dense(
     Initialize MoE experts from dense NCM generator checkpoint.
     """
     
-    print(f"Loading dense checkpoint from {dense_checkpoint}...")
+    logger.info(f"Loading dense checkpoint from {dense_checkpoint}...")
     ckpt = torch.load(dense_checkpoint, map_location='cpu')
     state_dict = ckpt['model']
     
@@ -42,7 +64,8 @@ def init_experts_from_dense(
     )
     
     for layer_idx in range(n_layers):
-        print(f"Processing layer {layer_idx}...")
+        layer_start = time.time()
+        logger.info(f"Processing layer {layer_idx}...")
         
         # Extract dense MLP weights
         c_fc = state_dict[f'transformer.blocks.{layer_idx}.mlp.c_fc.weight']  # [3072, 768]
@@ -50,7 +73,7 @@ def init_experts_from_dense(
         c_proj = state_dict[f'transformer.blocks.{layer_idx}.mlp.c_proj.weight']  # [768, 3072]
         c_proj_bias = state_dict.get(f'transformer.blocks.{layer_idx}.mlp.c_proj.bias')
         
-        print(f"  c_fc shape: {c_fc.shape}, c_proj shape: {c_proj.shape}")
+        logger.info(f"  c_fc shape: {c_fc.shape}, c_proj shape: {c_proj.shape}")
         
         # Convert to numpy for k-means
         fc_weight = c_fc.numpy().astype(np.float32)  # [hidden, d_model]
@@ -59,21 +82,22 @@ def init_experts_from_dense(
         # Concatenate fc and proj^T for clustering
         # fc: [hidden, d_model], proj^T: [hidden, d_model]
         proj_weight_t = proj_weight.T  # [hidden, d_model]
-        print(f"  fc_weight shape: {fc_weight.shape}, proj_weight_t shape: {proj_weight_t.shape}")
+        logger.info(f"  fc_weight shape: {fc_weight.shape}, proj_weight_t shape: {proj_weight_t.shape}")
         
         combined = np.concatenate([fc_weight, proj_weight_t], axis=1)  # [hidden, 2*d_model]
-        print(f"  Combined shape: {combined.shape}")
+        logger.info(f"  Combined shape: {combined.shape}")
         
-        print(f"  Clustering {combined.shape[0]} hidden units into {n_experts} experts...")
+        logger.info(f"  Clustering {combined.shape[0]} hidden units into {n_experts} experts...")
+        cluster_start = time.time()
         kmeans = KMeans(n_clusters=n_experts, random_state=random_state, n_init=10)
         cluster_labels = kmeans.fit_predict(combined)
         centroids = kmeans.cluster_centers_  # [n_experts, 2*d_model]
-        print(f"  Centroids shape: {centroids.shape}")
+        logger.info(f"  KMeans completed in {time.time() - cluster_start:.1f}s, Centroids shape: {centroids.shape}")
         
         # Split centroids back
         fc_centroids = centroids[:, :d_model]  # [n_experts, d_model]
         proj_centroids = centroids[:, d_model:].T  # [d_model, n_experts]
-        print(f"  fc_centroids shape: {fc_centroids.shape}, proj_centroids shape: {proj_centroids.shape}")
+        logger.info(f"  fc_centroids shape: {fc_centroids.shape}, proj_centroids shape: {proj_centroids.shape}")
         
         # For each expert, create full SwiGLU weights
         for e in range(n_experts):
@@ -82,14 +106,10 @@ def init_experts_from_dense(
             up_base = fc_centroids[e:e+1]    # [1, d_model] (same init)
             down_base = proj_centroids[:, e:e+1]  # [d_model, 1]
             
-            print(f"  Expert {e}: gate_base shape: {gate_base.shape}")
-            
             # Expand to expert_hidden with noise
             gate_weight = gate_base.repeat(expert_hidden, axis=0) + np.random.randn(expert_hidden, d_model).astype(np.float32) * 0.01
             up_weight = up_base.repeat(expert_hidden, axis=0) + np.random.randn(expert_hidden, d_model).astype(np.float32) * 0.01
             down_weight = down_base.repeat(expert_hidden, axis=1) + np.random.randn(d_model, expert_hidden).astype(np.float32) * 0.01
-            
-            print(f"  Expert {e}: gate_weight shape: {gate_weight.shape}")
             
             # Convert to torch
             expert_tensors = {
@@ -115,22 +135,19 @@ def init_experts_from_dense(
                 expert_tensors["down_bias"] = down_bias
             
             pager.save_expert(layer_idx, e, expert_tensors)
+            
+            # Log progress every 16 experts
+            if (e + 1) % 16 == 0:
+                logger.info(f"  Layer {layer_idx}: saved {e+1}/{n_experts} experts")
         
-        print(f"  Layer {layer_idx}: saved {n_experts} experts")
+        layer_time = time.time() - layer_start
+        logger.info(f"  Layer {layer_idx}: saved {n_experts} experts in {layer_time:.1f}s")
     
-    print(f"\nAll experts saved to {expert_dir}")
-    print(f"Index: {os.path.join(expert_dir, 'expert_index.json')}")
+    logger.info(f"\nAll experts saved to {expert_dir}")
+    logger.info(f"Index: {os.path.join(expert_dir, 'expert_index.json')}")
     
     # Verify
-    total_size = 0
-    for layer_idx in range(n_layers):
-        for e in range(n_experts):
-            path = pager.index.get_path(layer_idx, e)
-            total_size += os.path.getsize(path)
-    print(f"Total expert storage: {total_size / 1e9:.2f} GB")
-
-
 if __name__ == "__main__":
     os.makedirs("experts", exist_ok=True)
     init_experts_from_dense()
-    print("Expert initialization complete!")
+    logger.info("Expert initialization complete!")

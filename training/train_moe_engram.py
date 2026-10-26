@@ -15,6 +15,35 @@ from torch.amp import GradScaler, autocast
 from omegaconf import OmegaConf
 import os
 import pickle
+import time
+import logging
+from tqdm import tqdm
+import math
+
+from models.moe_engram_generator import MoEEngramNextConceptTransformer, create_moe_engram_model
+from models.common import NextConceptTransformer
+from tokenization.vqvae_tokenizer import VQVAETokenizer
+
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    handlers=[
+        logging.FileHandler('training.log', mode='a'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torch.amp import GradScaler, autocast
+from omegaconf import OmegaConf
+import os
+import pickle
 from tqdm import tqdm
 import math
 
@@ -41,9 +70,7 @@ class TinyStoriesDataset(Dataset):
         for seq in self.data:
             for i in range(0, len(seq) - context_length, context_length // 2):
                 self.chunks.append(seq[i:i + context_length])
-        
-        print(f"Dataset: {len(self.chunks)} chunks of length {context_length}")
-    
+        logger.info(f"Dataset: {len(self.chunks)} chunks of length {context_length}")
     def __len__(self):
         return len(self.chunks)
     
@@ -93,11 +120,10 @@ def get_optimizer(model, lr_trunk=3e-4, lr_engram=1e-4, lr_expert=3e-3, weight_d
         else:
             trunk_params.append(param)
     
-    print(f"Parameter groups:")
-    print(f"  Trunk: {sum(p.numel() for p in trunk_params)/1e6:.1f}M params")
-    print(f"  Engram tables: {sum(p.numel() for p in engram_table_params)/1e6:.1f}M params")
-    print(f"  Experts: {sum(p.numel() for p in expert_params)/1e6:.1f}M params")
-    
+    logger.info(f"Parameter groups:")
+    logger.info(f"  Trunk: {sum(p.numel() for p in trunk_params)/1e6:.1f}M params")
+    logger.info(f"  Engram tables: {sum(p.numel() for p in engram_table_params)/1e6:.1f}M params")
+    logger.info(f"  Experts: {sum(p.numel() for p in expert_params)/1e6:.1f}M params")
     optimizer = torch.optim.AdamW([
         {'params': trunk_params, 'lr': lr_trunk, 'weight_decay': weight_decay},
         {'params': engram_table_params, 'lr': lr_engram, 'weight_decay': 0.01},
@@ -197,15 +223,14 @@ def main():
     config = OmegaConf.load('artifacts/tinystories/config.yaml')
     
     # Model
-    print("Creating model...")
+    logger.info("Creating model...")
     model = create_moe_engram_model('artifacts/tinystories/config.yaml', expert_dir='experts')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     
-    print(f"Model on {device}: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
-    
+    logger.info(f"Model on {device}: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
     # Dataset
-    print("Preparing dataset...")
+    logger.info("Preparing dataset...")
     data_path = prepare_dataset()
     dataset = TinyStoriesDataset(data_path, context_length=config.model.context_length)
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=0, pin_memory=True)
@@ -220,7 +245,7 @@ def main():
     accum_steps = 8
     step = 0
     
-    print(f"Starting training: {max_steps} steps, batch=4, accum={accum_steps}")
+    logger.info(f"Starting training: {max_steps} steps, batch=4, accum={accum_steps}")
     
     model.train()
     
@@ -232,20 +257,19 @@ def main():
                 scheduler.step()
                 
                 if step % 500 == 0:
-                    print(f"Step {step}: loss={loss:.4f}, router_loss={router_loss:.4f}, lr={scheduler.get_last_lr()[0]:.2e}")
+                    logger.info(f"Step {step}: loss={loss:.4f}, router_loss={router_loss:.4f}, lr={scheduler.get_last_lr()[0]:.2e}")
                 
                 # Periodic checkpoint
                 if step % 1000 == 0:
                     save_checkpoint(model, optimizer, scheduler, step, f'checkpoints/step_{step}.pt')
-                    print(f"Checkpoint saved at step {step}")
+                    logger.info(f"Checkpoint saved at step {step}")
                 
                 if step >= max_steps:
-                    print("Training complete!")
+                    logger.info("Training complete!")
                     save_checkpoint(model, optimizer, scheduler, step, f'checkpoints/step_{step}.pt')
                     return
                 
                 step += 1
-
 
 if __name__ == "__main__":
     main()
