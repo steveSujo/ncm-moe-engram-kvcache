@@ -1,0 +1,53 @@
+{
+  "model_config": {
+    "model": {
+      "vocab_size": 1000,
+      "d_model": 256,
+      "n_layers": 2,
+      "n_heads": 4,
+      "head_dim": 32,
+      "d_ff": 1024,
+      "n_experts": 4,
+      "top_k": 2,
+      "resident_slots": 2,
+      "engram_layers": [
+        1
+      ],
+      "engram_slots": 1024,
+      "engram_heads": 2,
+      "engram_orders": [
+        2,
+        3
+      ],
+      "max_window": 128,
+      "sink_tokens": 1,
+      "weight_bits": 1.58,
+      "tie_embeddings": true,
+      "max_seq_len": 256,
+      "dropout": 0.1
+    }
+  },
+  "vram": {
+    "peak_mb": 21.16943359375,
+    "avg_mb": 15.02587890625,
+    "allocated_mb": 15.02587890625,
+    "reserved_mb": 34.0
+  },
+  "latency": {
+    "tokens_per_sec": 46.613609812546166,
+    "ms_per_token": 21.452962000184925,
+    "prefill_ms": 32.533300000068266,
+    "decode_ms_per_token": 21.452962000184925,
+    "total_time_sec": 1.1051814000093145
+  },
+  "quality": {
+    "perplexity": null,
+    "compile_success_rate": null,
+    "syntax_valid_rate": 0.0,
+    "compile_errors": [
+      "Invalid syntax: \u00b5L2map\u00e6%II`->III\u00aenot0is\u00ceM0Z",
+      "Invalid syntax: >p\u00d7\u00d7\u00dd[\u00ea\u00eawrite_file\fis\u00ebq`as\u0013\u0006r\u00bdowhilek"
+    ]
+  },
+  "timestamp": "2026-10-27 23:35:24"
+}

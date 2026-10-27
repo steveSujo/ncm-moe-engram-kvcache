@@ -1,0 +1,58 @@
+transpiler:
+  # psudo language specification
+  spec_version: "1.0.0"
+  
+  # Grammar configuration
+  grammar:
+    entry_point: "program"
+    start_symbol: "program"
+  
+  # Valid builtins
+  builtins:
+    - name: "read_file"
+      signature: "(path: string) -> string"
+    - name: "write_file"
+      signature: "(path: string, content: string) -> ()"
+    - name: "print"
+      signature: "(value: any) -> ()"
+    - name: "len"
+      signature: "(value: any) -> int"
+    - name: "range"
+      signature: "(start: int, end: int) -> list<int>"
+    - name: "list"
+      signature: "(elements: ...) -> list"
+    - name: "dict"
+      signature: "(pairs: ...) -> dict"
+  
+  # Type system
+  types:
+    primitives: ["int", "float", "string", "bool", "void"]
+    containers: ["list", "dict", "tuple"]
+    special: ["any", "never"]
+  
+  # Target Rust configuration
+  rust:
+    edition: "2021"
+    crate_name: "psudo_generated"
+    dependencies:
+      - name: "tokio"
+        version: "1.0"
+        features: ["full"]
+      - name: "reqwest"
+        version: "0.11"
+        features: ["json"]
+      - name: "serde"
+        version: "1.0"
+        features: ["derive"]
+      - name: "serde_json"
+        version: "1.0"
+      - name: "anyhow"
+        version: "1.0"
+      - name: "thiserror"
+        version: "1.0"
+  
+  # Output configuration
+  output:
+    dir: "transpiled_output"
+    format: true
+    cargo_check: true

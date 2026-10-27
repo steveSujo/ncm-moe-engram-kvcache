@@ -1,0 +1,55 @@
+{
+  "model_config": {
+    "model": {
+      "vocab_size": 8192,
+      "d_model": 512,
+      "n_layers": 12,
+      "n_heads": 8,
+      "head_dim": 64,
+      "d_ff": 2048,
+      "n_experts": 64,
+      "top_k": 2,
+      "resident_slots": 32,
+      "engram_layers": [
+        4,
+        12,
+        20
+      ],
+      "engram_slots": 8192,
+      "engram_heads": 4,
+      "engram_orders": [
+        2,
+        3
+      ],
+      "max_window": 256,
+      "sink_tokens": 1,
+      "weight_bits": 1.58,
+      "tie_embeddings": true,
+      "max_seq_len": 2048,
+      "dropout": 0.1
+    }
+  },
+  "vram": {
+    "peak_mb": 286.2080078125,
+    "avg_mb": 173.1416015625,
+    "allocated_mb": 173.1416015625,
+    "reserved_mb": 298.0
+  },
+  "latency": {
+    "tokens_per_sec": 11.244469773040512,
+    "ms_per_token": 88.93260599958012,
+    "prefill_ms": 117.57970000326168,
+    "decode_ms_per_token": 88.93260599958012,
+    "total_time_sec": 4.564209999982268
+  },
+  "quality": {
+    "perplexity": null,
+    "compile_success_rate": null,
+    "syntax_valid_rate": 0.0,
+    "compile_errors": [
+      "Invalid syntax: @\u0006,",
+      "Invalid syntax: T,\u000fT"
+    ]
+  },
+  "timestamp": "2026-10-27 23:35:39"
+}

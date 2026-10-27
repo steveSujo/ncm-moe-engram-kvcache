@@ -1,0 +1,22 @@
+model:
+  vocab_size: 8192        # psudo token vocabulary
+  d_model: 512
+  n_layers: 24
+  n_heads: 8
+  head_dim: 64
+  d_ff: 2048
+  n_experts: 64           # per layer
+  top_k: 2
+  resident_slots: 32      # VRAM resident experts
+  engram_layers: [4, 12, 20]
+  engram_slots: 8192
+  engram_orders: [2, 3]
+  engram_heads: 4
+  max_window: 256
+  sink_tokens: 1
+  weight_bits: 1.58       # ternary
+  kv_bits: 8
+  act_bits: 8
+  rope_theta: 10000.0
+  dropout: 0.1
+  tie_embeddings: true
