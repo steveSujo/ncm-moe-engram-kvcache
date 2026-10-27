@@ -21,27 +21,28 @@ def fnv1a_hash(data: torch.Tensor, num_buckets: int, seed: int = 0) -> torch.Ten
         data = data.unsqueeze(-1)  # [B, T, 1]
     
     B, T, H = data.shape
+    device = data.device
     # Use int64 for compatibility
-    hash_vals = torch.full((B, T, H), seed, dtype=torch.int64, device=data.device)
+    hash_vals = torch.zeros((B, T, H), dtype=torch.int64, device=device)
     
+    fnv_prime = 16777619
+    offset_basis = 2166136261
+    
+    # Process each head separately
     for h in range(H):
         x = data[:, :, h].to(torch.int64)
-        # FNV-1a constants (32-bit version for compatibility)
-        fnv_prime = 16777619
-        offset_basis = 2166136261 + seed * 12345 + h * 67890
+        h_val = torch.full((B, T), offset_basis + seed * 12345 + h * 67890, dtype=torch.int64, device=device)
         
-        h_val = offset_basis
-        # Process bytes
-        for i in range(4):  # 32-bit hash, 4 bytes
+        # FNV-1a: process 4 bytes (32-bit)
+        for i in range(4):
             byte = (x >> (i * 8)) & 0xFF
-            h_val ^= byte.to(torch.int64)
-            h_val = (h_val * fnv_prime) & 0xFFFFFFFF
+            h_val = h_val ^ byte
+            h_val = (h_val * 16777619) & 0xFFFFFFFF
         
+        # Modulo to get bucket index
         hash_vals[:, :, h] = h_val % num_buckets
     
     return hash_vals.to(torch.long)
-
-
 def engram_indices(
     tokens: torch.Tensor,
     orders: List[int],

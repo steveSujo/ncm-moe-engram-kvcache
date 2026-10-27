@@ -7,18 +7,20 @@ Two-timescale optimizer:
 - MoE experts: LR 3e-3 (10x trunk)
 """
 
+import os
+# Memory optimization environment variables
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import GradScaler, autocast
 from omegaconf import OmegaConf
-import os
-import pickle
-import time
 import logging
 from tqdm import tqdm
 import math
+import pickle
 
 from models.moe_engram_generator import MoEEngramNextConceptTransformer, create_moe_engram_model
 from models.common import NextConceptTransformer
@@ -35,21 +37,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from torch.amp import GradScaler, autocast
-from omegaconf import OmegaConf
-import os
-import pickle
-from tqdm import tqdm
-import math
-
-from models.moe_engram_generator import MoEEngramNextConceptTransformer, create_moe_engram_model
-from models.common import NextConceptTransformer
-from tokenization.vqvae_tokenizer import VQVAETokenizer
 
 
 class TinyStoriesDataset(Dataset):
@@ -107,52 +94,50 @@ def prepare_dataset():
     else:
         raise FileNotFoundError(f"Dataset not found at {path1} or {path2}")
 
+
 def get_optimizer(model, lr_trunk=3e-4, lr_engram=1e-4, lr_expert=3e-3, weight_decay=0.1):
     """
     Two-timescale optimizer.
     
     Groups:
     - trunk: attention, embeddings, heads, engram projections, routers, norms
-    - engram_tables: Engram embedding tables (can be slower)
-    - experts: MoE expert weights (dynamic, higher LR)
+    - engram: engram embedding tables
+    - experts: MoE expert weights (only resident experts)
     """
-    
     trunk_params = []
-    engram_table_params = []
+    engram_params = []
     expert_params = []
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        
-        if 'expert' in name or 'mlp.gate' in name or 'mlp.up' in name or 'mlp.down' in name:
+        if 'engrams' in name and 'embedding' in name:
+            engram_params.append(param)
+        elif 'blocks' in name and 'mlp' in name and 'expert' in name:
             expert_params.append(param)
-        elif 'engram.embeddings' in name or 'engram.embedding' in name:
-            engram_table_params.append(param)
         else:
             trunk_params.append(param)
     
-    logger.info(f"Parameter groups:")
-    logger.info(f"  Trunk: {sum(p.numel() for p in trunk_params)/1e6:.1f}M params")
-    logger.info(f"  Engram tables: {sum(p.numel() for p in engram_table_params)/1e6:.1f}M params")
-    logger.info(f"  Experts: {sum(p.numel() for p in expert_params)/1e6:.1f}M params")
+    logger.info(f"Optimizer groups: trunk={sum(p.numel() for p in trunk_params)/1e6:.1f}M, "
+                f"engram={sum(p.numel() for p in engram_params)/1e6:.1f}M, "
+                f"experts={sum(p.numel() for p in expert_params)/1e6:.1f}M")
+    
     optimizer = torch.optim.AdamW([
         {'params': trunk_params, 'lr': lr_trunk, 'weight_decay': weight_decay},
-        {'params': engram_table_params, 'lr': lr_engram, 'weight_decay': 0.01},
+        {'params': engram_params, 'lr': lr_engram, 'weight_decay': 0.01},
         {'params': expert_params, 'lr': lr_expert, 'weight_decay': weight_decay},
-    ], betas=(0.9, 0.95), fused=True)
+    ])
     
     return optimizer
 
 
 def get_scheduler(optimizer, warmup_steps=1000, max_steps=50000):
     """Cosine decay with warmup."""
-    
     def lr_lambda(step):
         if step < warmup_steps:
             return step / warmup_steps
         progress = (step - warmup_steps) / (max_steps - warmup_steps)
-        return 0.5 * (1 + math.cos(math.pi * progress))
+        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -169,7 +154,7 @@ def train_step(model, batch, tokenizer, optimizer, scaler, accum_steps, step):
     # Get NCM inputs from tokenizer (VQ-VAE encoding)
     with torch.no_grad():
         x, targets = tokenizer.vqvae.get_ncm_inputs(batch)
-        # x: [B, num_levels, T, embed_dim] multi-level quantized codes
+        # x: [B, sum_levels, embed_dim] concatenated multi-level codes
         # targets: [B, sum_levels] flattened target indices for all levels
     
     # Forward with autocast
@@ -203,13 +188,14 @@ def train_step(model, batch, tokenizer, optimizer, scaler, accum_steps, step):
         
         scaler.step(optimizer)
         scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_none=True)
     
     return total_loss.item(), router_loss.item()
+
+
 def save_checkpoint(model, optimizer, scheduler, step, path):
     """Save training checkpoint."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    
     torch.save({
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
@@ -226,20 +212,24 @@ def save_checkpoint(model, optimizer, scheduler, step, path):
 def main():
     # Config
     config = OmegaConf.load('artifacts/tinystories/config.yaml')
+    
     # Model
     logger.info("Creating model...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = create_moe_engram_model('artifacts/tinystories/config.yaml', expert_dir='experts')
     model = model.to(device)
     
-    # Also load tokenizer for encoding
+    logger.info(f"Model on {device}: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+    
+    # Also load tokenizer for encoding (create_moe_engram_model already creates one, but we need it for get_ncm_inputs)
     from tokenization.vqvae_tokenizer import VQVAETokenizer
     tokenizer = VQVAETokenizer.from_config(config.tokenizer, base_dir='artifacts/tinystories')
     tokenizer.vqvae.eval()
     for p in tokenizer.vqvae.parameters():
         p.requires_grad = False
     tokenizer.vqvae.to(device)
-    # Dataset
+    # Convert tokenizer to bfloat16 to match model
+    tokenizer.vqvae = tokenizer.vqvae.to(torch.bfloat16)
     logger.info("Preparing dataset...")
     data_path = prepare_dataset()
     dataset = TinyStoriesDataset(data_path, context_length=config.model.context_length)
@@ -274,12 +264,17 @@ def main():
                     save_checkpoint(model, optimizer, scheduler, step, f'checkpoints/step_{step}.pt')
                     logger.info(f"Checkpoint saved at step {step}")
                 
+                # Periodic cache clear to reduce fragmentation
+                if step % 100 == 0:
+                    torch.cuda.empty_cache()
+                
                 if step >= max_steps:
                     logger.info("Training complete!")
                     save_checkpoint(model, optimizer, scheduler, step, f'checkpoints/step_{step}.pt')
                     return
                 
                 step += 1
+
 
 if __name__ == "__main__":
     main()

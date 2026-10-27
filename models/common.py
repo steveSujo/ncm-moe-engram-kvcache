@@ -27,7 +27,7 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # RMSNorm: x * weight / sqrt(mean(x^2) + eps) + bias
         dtype = x.dtype
-        x = x.float()
+        x = x.to(torch.float32)
         rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         x = x / rms * self.weight
         if self.bias is not None:
@@ -67,19 +67,25 @@ class SelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         
-        # Causal mask
+        # Causal mask - use max_seq_len for NCM (640 tokens)
+        max_seq_len = getattr(config, 'max_seq_len', config.context_length)
+        # NCM uses 640 tokens (sum of levels 1-11 = 640)
+        if max_seq_len < 640:
+            max_seq_len = 640
         self.register_buffer(
             "bias",
-            torch.tril(torch.ones(config.context_length, config.context_length))
-            .view(1, 1, config.context_length, config.context_length),
+            torch.tril(torch.ones(max_seq_len, max_seq_len))
+            .view(1, 1, max_seq_len, max_seq_len),
             persistent=False
         )
         
         # RoPE
         self.use_rope = getattr(config, 'use_rope', True)
         self.rope_base = getattr(config, 'rope_base', 100000)
+        # Build RoPE cache for maximum sequence length (NCM uses 640 = sum of levels 1-11)
+        max_len = max_seq_len
         if self.use_rope:
-            cos, sin = self._build_rope_cache(config.context_length)
+            cos, sin = self._build_rope_cache(max_len)
             self.register_buffer("rope_cos", cos, persistent=False)
             self.register_buffer("rope_sin", sin, persistent=False)
     
@@ -181,16 +187,25 @@ class SelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         
         return y
+    
+    def _build_rope_cache(self, max_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build RoPE cache (cos, sin) for max_len."""
+        inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        t = torch.arange(max_len, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos(), emb.sin()
+    
+    def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Apply RoPE to x [B, H, T, D]."""
+        x1, x2 = x.chunk(2, dim=-1)
+        x = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        return x
 
 
 class MLP(nn.Module):
     """
-    Standard Feedforward Network (replaced by MoEBlock).
-    
-    From NCM checkpoint:
-    - c_fc: [3072, 768] (up projection)
-    - c_proj: [768, 3072] (down projection)
-    - Uses GELU activation
+    Standard Feedforward Network (replaced by MoEBlock in our model).
     """
     
     def __init__(self, config):
@@ -199,7 +214,7 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x = self.c_fc(x)
         x = F.gelu(x)
         x = self.c_proj(x)
@@ -251,45 +266,43 @@ class Block(nn.Module):
 class NextConceptTransformer(nn.Module):
     """
     Base NCM Generator (parallel coarse-to-fine).
-    
-    This is the original architecture without MoE/Engram/KV-cache enhancements.
+    Recreated from HazyResearch NCM checkpoint structure.
     """
     
-    def __init__(self, vqvae_local, config):
+    def __init__(self, config):
         super().__init__()
-        self.vqvae_local = vqvae_local
         self.config = config
         
-        # Model params
         self.n_layer = config.n_layer
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.vocab_size = config.vocab_size
         self.context_length = config.context_length
         self.prefix_len = config.prefix_len
-        self.tie_heads_to_codebook = config.tie_heads_to_codebook
         
         # Embeddings
-        vocab_0 = config.vocab_size[0] if isinstance(config.vocab_size, list) else config.vocab_size
-        self.wte = nn.Embedding(vocab_0, config.n_embd)
+        vocab_size_0 = int(config.vocab_size[0]) if hasattr(config.vocab_size, '__getitem__') else int(config.vocab_size)
+        self.wte = nn.Embedding(vocab_size_0, config.n_embd)
         self.wle = nn.Embedding(len(config.vocab_size), config.n_embd) if config.use_level_encoding else None
         self.wpe = nn.Embedding(config.context_length, config.n_embd) if config.use_positional_encoding else None
         
+        # Dropout
         self.drop = nn.Dropout(config.dropout)
         
-        # Transformer
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.ln_f = RMSNorm(config.n_embd)
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            Block(config) for _ in range(config.n_layer)
+        ])
+        
+        self.ln_f = RMSNorm(config.n_embd, bias=config.bias)
         
         # Output heads
         self.lm_heads = nn.ModuleList([
             nn.Linear(config.n_embd, vs, bias=False) for vs in config.vocab_size
         ])
         
+        # Initialize weights
         self.apply(self._init_weights)
-        
-        if self.tie_heads_to_codebook:
-            self._tie_heads_to_codebook()
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -298,25 +311,17 @@ class NextConceptTransformer(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
-        elif isinstance(module, RMSNorm):
-            nn.init.ones_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
     
-    def _tie_heads_to_codebook(self):
-        codebooks = self.vqvae_local.get_codebooks()
-        for level, head in enumerate(self.lm_heads):
-            if level < len(codebooks):
-                head.weight.data = codebooks[level].to(head.weight.dtype).clone()
-    
-    def forward(self, idx, level=0, targets=None):
-        B, T = idx.shape
-        device = idx.device
+    def forward(self, x, targets=None):
+        B, T = x.shape
+        device = x.device
         
-        tok_emb = self.wte(idx)
+        tok_emb = self.wte(x)
+        
         if self.wle is not None:
-            lvl_emb = self.wle(torch.full((B, T), level, dtype=torch.long, device=device))
+            lvl_emb = self.wle(torch.arange(T, device=device).unsqueeze(0).expand(B, -1))
             tok_emb = tok_emb + lvl_emb
+        
         if self.wpe is not None:
             pos = torch.arange(T, device=device).unsqueeze(0)
             pos_emb = self.wpe(pos)
@@ -324,11 +329,12 @@ class NextConceptTransformer(nn.Module):
         
         x = self.drop(tok_emb)
         
-        for i, block in enumerate(self.blocks):
-            x = block(x, layer_idx=i)
+        for block in self.blocks:
+            x = block(x)
         
         x = self.ln_f(x)
-        logits = self.lm_heads[level](x)
+        
+        logits = torch.cat([head(x) for head in self.lm_heads], dim=-1)
         
         loss = None
         if targets is not None:
@@ -336,43 +342,30 @@ class NextConceptTransformer(nn.Module):
         
         return logits, loss
     
-    def generate(self, idx, l0=None, temperature=1.0, top_k=0, top_p=1.0, cfg_scale=0.0):
-        """Autoregressive generation (simplified)."""
-        self.eval()
-        # ... generation logic ...
-        return idx
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, std=0.02)
 
 
 if __name__ == "__main__":
     # Quick test
     from omegaconf import OmegaConf
-    config = OmegaConf.create({
-        'n_layer': 12,
-        'n_head': 12,
-        'n_embd': 768,
-        'vocab_size': [4096] * 11,
-        'context_length': 129,
-        'prefix_len': 1,
-        'bias': True,
-        'dropout': 0.1,
-        'use_level_encoding': True,
-        'use_positional_encoding': True,
-        'use_rope': True,
-        'rope_base': 100000,
-        'tie_heads_to_codebook': True,
-    })
     
-    block = Block(config)
-    x = torch.randn(2, 128, 768)
-    out = block(x)
-    print(f"Block: {x.shape} -> {out.shape}")
+    config = OmegaConf.load('artifacts/tinystories/config.yaml')
+    model = NextConceptTransformer(config.model)
+    print(f"Model created: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
     
-    attn = SelfAttention(config)
-    out = attn(x)
-    print(f"Attention: {x.shape} -> {out.shape}")
+    # Test forward
+    B, T = 2, 128
+    x = torch.randint(0, 4096, (B, T))
+    model.eval()
+    with torch.no_grad():
+        logits, loss = model(x, targets=torch.randint(0, 4096, (B, T)))
     
-    mlp = MLP(config)
-    out = mlp(x)
-    print(f"MLP: {x.shape} -> {out.shape}")
-    
+    print(f"Logits shape: {logits.shape}")
+    print(f"Loss: {loss.item():.4f}")
     print("Common components test passed!")
