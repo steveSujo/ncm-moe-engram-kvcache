@@ -1,0 +1,77 @@
+# NCM 2-bit Model Configuration
+model:
+  d_model: 512
+  n_heads: 8
+  n_layers: 12
+  d_ff: 2048
+  vocab_size: 4096
+  num_levels: 11
+  max_seq_len: 512
+  dropout: 0.1
+  
+  # Engram config
+  engram:
+    enabled: true
+    layers: [2, 11]  # 0-indexed: layers 3 and 12
+    orders: [2, 3]
+    num_slots: 8192
+    num_heads: 4
+    compression_ratio: 0.125
+    decay: 0.99
+  
+  # MoE config
+  moe:
+    num_experts: 64
+    top_k: 2
+    resident_slots: 32
+    capacity_factor: 1.25
+    router_jitter_noise: 0.01
+  
+  # Quantization config
+  quantization:
+    bits: 2.0
+    group_size: 128
+    kv_bits: 2.0
+    kv_group_size: 64
+
+training:
+  batch_size: 4
+  grad_accum: 8
+  max_steps: 50000
+  warmup_steps: 1000
+  
+  # Optimizer
+  optimizer:
+    trunk_lr: 3e-4
+    engram_lr: 1e-4
+    expert_lr: 3e-3
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    eps: 1e-8
+  
+  # Gradient clipping
+  grad_clip: 1.0
+  
+  # Checkpointing
+  checkpoint_every: 1000
+  expert_checkpoint_every: 1000
+  keep_last_n_checkpoints: 3
+  
+  # Precision
+  mixed_precision: bf16
+  gradient_checkpointing: true
+
+# Paths
+paths:
+  data_dir: "data"
+  expert_dir: "experts"
+  checkpoint_dir: "checkpoints"
+  artifact_dir: "artifacts"
+  log_dir: "logs"
+
+# Logging
+logging:
+  log_every: 100
+  eval_every: 5000
+  wandb: false
+  wandb_project: "ncm-2bit"

@@ -61,12 +61,19 @@ _TERNARY_CB = torch.tensor([-1.2240064, 0.0, 1.2240064], dtype=torch.float32)
 def get_codebook(bits: float, group_size: int) -> torch.Tensor:
     """Get quantization codebook for given bits and group size.
     
-    Returns codebook normalized by sqrt(group_size) as in Needle.
+    Codebook is normalized by sqrt(group_size) so that quantized values
+    have unit variance when applied to normalized vectors.
     """
     if bits == 1.58:
-        cb = _TERNARY_CB
+        cb = _TERNARY_CB.clone()
+    elif bits == 2.0:
+        cb = lloyd_max_gaussian(2)
+    elif bits == 4.0:
+        cb = lloyd_max_gaussian(4)
     else:
         cb = lloyd_max_gaussian(int(bits))
+    
+    # Normalize by sqrt(group_size) for proper scaling
     return (cb / math.sqrt(group_size)).to(torch.float32)
 
 
@@ -78,26 +85,22 @@ def get_codebook(bits: float, group_size: int) -> torch.Tensor:
 def hadamard_matrix(group_size: int) -> torch.Tensor:
     """Generate normalized Hadamard matrix of given size.
     
-    H = [H, H; H, -H] recursively, normalized by 1/sqrt(group_size)
+    H = [H, H; H, -H] recursively, normalized by 1/sqrt(group_size).
+    Requires group_size to be a power of 2.
     """
-    if group_size == 1:
-        return torch.tensor([[1.0]], dtype=torch.float32)
+    # Verify group_size is power of 2
+    assert group_size & (group_size - 1) == 0, f"group_size must be power of 2, got {group_size}"
     
-    # Find next power of 2 >= group_size
-    n = 1
-    while n < group_size:
-        n *= 2
-    
-    H = torch.eye(1, dtype=torch.float32)
-    while H.shape[0] < n:
-        H = torch.block_diag(H, H)  # This doesn't work for Hadamard
-        # Correct Hadamard construction:
+    H = torch.tensor([[1.0]], dtype=torch.float32)
+    while H.shape[0] < group_size:
         H = torch.cat([
             torch.cat([H, H], dim=1),
             torch.cat([H, -H], dim=1)
         ], dim=0)
     
-    H = H[:group_size, :group_size] / math.sqrt(group_size)
+    # Normalize by sqrt(group_size) for orthogonality
+    H = H / math.sqrt(group_size)
+    
     return H.to(torch.float32)
 
 
@@ -160,15 +163,29 @@ def cq_quantize(
     
     # Store norm in fp16 for storage efficiency (as in Needle)
     norm_fp16 = norm.to(torch.float16).to(w.dtype)
-    # Nearest neighbor lookup in codebook
+    
+    # Nearest neighbor lookup in codebook (memory-efficient chunked version)
     # codebook: [num_levels], unit: [..., group_size]
     # For each element in unit, find nearest codebook entry
-    # Use broadcasting: unit [..., group_size, 1] - codebook [num_levels]
-    diff = unit.unsqueeze(-1) - codebook.view(*([1] * (unit.ndim - 1)), -1)
-    idx = torch.argmin(torch.abs(diff), dim=-1)  # [..., num_groups, group_size]
+    # Process in chunks to avoid OOM for large tensors
+    flat_shape = unit.shape[:-1]
+    num_elements = unit.shape[-1]
+    unit_flat = unit.reshape(-1, num_elements)
     
-    # Dequantize
-    deq = codebook[idx]  # [..., num_groups, group_size]
+    deq_flat = torch.zeros_like(unit_flat)
+    codebook_flat = codebook.view(-1)  # [num_levels]
+    
+    # Process in chunks of 1024 rows
+    chunk_size = 1024
+    for i in range(0, unit_flat.shape[0], chunk_size):
+        chunk = unit_flat[i:i+chunk_size]  # [chunk_size, group_size]
+        # Broadcast: [chunk_size, group_size, 1] - [1, 1, num_levels]
+        diff = chunk.unsqueeze(-1) - codebook_flat.view(1, 1, -1)
+        idx = torch.argmin(torch.abs(diff), dim=-1)  # [chunk_size, group_size]
+        deq_flat[i:i+chunk_size] = codebook_flat[idx]
+    
+    # Restore shape
+    deq = deq_flat.reshape(flat_shape + (num_elements,))
     
     # Denormalize
     deq = deq * norm_fp16
@@ -182,6 +199,9 @@ def cq_quantize(
     # Remove padding
     if pad:
         deq = deq[..., :D]
+    
+    # Replace any NaN/Inf with 0
+    deq = torch.nan_to_num(deq, nan=0.0, posinf=0.0, neginf=0.0)
     
     return deq
 
@@ -218,7 +238,9 @@ def cq_ste(
     Backward: identity gradient (STE)
     """
     if codebook is None:
-        codebook = get_codebook(w.dtype, w.device) if False else None  # Will compute inside
+        codebook = get_codebook(bits, group_size).to(device=w.device, dtype=w.dtype)
+    if hadamard is None:
+        hadamard = hadamard_matrix(group_size).to(device=w.device, dtype=w.dtype)
     return CQStraightThrough.apply(w, bits, group_size, codebook, hadamard)
 
 
@@ -286,6 +308,12 @@ def dequantize_kv_int8(k_q: torch.Tensor, k_scale: torch.Tensor,
     k = k_q.to(torch.bfloat16) * k_scale
     v = v_q.to(torch.bfloat16) * v_scale
     return k, v
+
+
+def dequantize_kv_cq(k_q: torch.Tensor, k_scale: torch.Tensor, 
+                      v_q: torch.Tensor, v_scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize CQ KV cache (alias for INT8 dequantization)."""
+    return dequantize_kv_int8(k_q, k_scale, v_q, v_scale)
 
 
 # ============================================================
@@ -391,6 +419,9 @@ class CQQuantizedLinear(nn.Module):
             # Fallback: full precision
             w = self.weight
         
+        # Ensure weight dtype matches input dtype
+        w = w.to(x.dtype)
+        
         return F.linear(x, w, self.bias)
     
     def prepare_for_inference(self):
@@ -442,9 +473,14 @@ class CQQuantizedEmbedding(nn.Module):
             w = self.weight_q
         else:
             w = self.weight
+        
+        # Ensure weight dtype is bfloat16 for NCM model
+        w = w.to(torch.bfloat16)
+        
         return F.embedding(x, w)
     
     def prepare_for_inference(self):
+        """Call after training to quantize weights for deployment."""
         self.quantize_weight()
         self.quantize = False
 
@@ -468,54 +504,54 @@ def quantize_model_parameters(
         exclude_patterns: Parameter name patterns to skip
     
     Returns:
-        Model with quantized weights (in-place)
+        Quantized model
     """
     for name, param in model.named_parameters():
         if any(pattern in name for pattern in exclude_patterns):
             continue
-        if param.ndim >= 2:  # Only quantize matrices
-            with torch.no_grad():
-                param.data = cq_quantize_simple(param.data, bits=2.0, group_size=128)
-    
+        if param.dim() >= 2:
+            # Quantize 2D+ parameters (weights)
+            param.data = cq_quantize_simple(param.data, bits, group_size)
     return model
 
 
 def quantize_specific_modules(
     model: nn.Module,
-    module_types: Tuple[type, ...] = (nn.Linear, nn.Embedding),
     bits: float = 2.0,
-    group_size: int = 128
+    group_size: int = 128,
+    target_modules: Tuple[type, ...] = (nn.Linear, nn.Embedding),
 ) -> nn.Module:
     """Replace specific module types with quantized versions."""
-    for name, module in model.named_modules():
-        if isinstance(module, module_types):
-            # Get parent
-            parent_name = '.'.join(name.split('.')[:-1])
-            child_name = name.split('.')[-1]
-            parent = model.get_submodule(parent_name) if parent_name else model
+    for name, module in list(model.named_modules()):
+        if isinstance(module, target_modules):
+            parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
+            parent = model if parent_name == '' else model.get_submodule(parent_name)
+            child_name = name.rsplit('.', 1)[-1]
             
             if isinstance(module, nn.Linear):
-                new_module = CQQuantizedLinear(
+                q_module = CQQuantizedLinear(
                     module.in_features,
                     module.out_features,
                     bias=module.bias is not None,
                     bits=bits,
-                    group_size=group_size
+                    group_size=group_size,
+                    quantize=True
                 )
-                new_module.weight.data = module.weight.data.clone()
+                q_module.weight.data = module.weight.data.clone()
                 if module.bias is not None:
-                    new_module.bias.data = module.bias.data.clone()
-                setattr(parent, child_name, new_module)
+                    q_module.bias.data = module.bias.data.clone()
+                setattr(parent, child_name, q_module)
             
             elif isinstance(module, nn.Embedding):
-                new_module = CQQuantizedEmbedding(
+                q_module = CQQuantizedEmbedding(
                     module.num_embeddings,
                     module.embedding_dim,
                     bits=bits,
-                    group_size=group_size
+                    group_size=group_size,
+                    quantize=True
                 )
-                new_module.weight.data = module.weight.data.clone()
-                setattr(parent, child_name, new_module)
+                q_module.weight.data = module.weight.data.clone()
+                setattr(parent, child_name, q_module)
     
     return model
 
@@ -532,17 +568,19 @@ KV_BITS = 8
 
 
 def configure_quantization(
-    weight_bits: float = 2.0,
+    group_size: int = 128,
+    head_bits: int = 4,
+    weight_bits: int = 4,
     act_bits: int = 8,
-    kv_bits: int = 8,
-    group_size: int = 128
+    kv_bits: int = 8
 ):
     """Configure global quantization settings."""
-    global WEIGHT_BITS, ACT_BITS, KV_BITS, CQ_GROUP_SIZE
+    global CQ_GROUP_SIZE, HEAD_BITS, WEIGHT_BITS, ACT_BITS, KV_BITS
+    CQ_GROUP_SIZE = group_size
+    HEAD_BITS = head_bits
     WEIGHT_BITS = weight_bits
     ACT_BITS = act_bits
     KV_BITS = kv_bits
-    CQ_GROUP_SIZE = group_size
 
 
 # ============================================================
@@ -551,52 +589,63 @@ def configure_quantization(
 
 if __name__ == "__main__":
     print("Testing Cactus Quants (CQ) 2-bit Quantization")
-    print("=" * 50)
-    
-    # Test codebook generation
-    cb_2 = get_codebook(2.0, 128)
-    cb_158 = get_codebook(1.58, 128)
-    print(f"2-bit codebook: {cb_2.shape}, values: {cb_2}")
-    print(f"1.58-bit codebook: {cb_158.shape}, values: {cb_158}")
     
     # Test Hadamard
-    H = hadamard_matrix(128)
-    print(f"Hadamard 128x128: {H.shape}, orthonormal check: {(H @ H.T).round().unique()}")
+    print("\n1. Testing Hadamard matrix...")
+    for size in [16, 32, 64, 128, 256]:
+        H = hadamard_matrix(size)
+        HHt = H @ H.T
+        I = torch.eye(size)
+        diff = (HHt - I).abs().max()
+        print(f"  size={size}: max diff={diff:.2e}, ortho={diff < 1e-5}")
     
-    # Test quantization
-    w = torch.randn(512, 768)  # Simulate expert weight
-    w_q = cq_quantize_simple(w, bits=2.0, group_size=128)
-    print(f"Original: {w.shape}, Quantized: {w_q.shape}")
-    print(f"Max abs error: {(w - w_q).abs().max().item():.6f}")
-    print(f"Mean abs error: {(w - w_q).abs().mean().item():.6f}")
-    print(f"SNR: {20 * torch.log10(w.abs().mean() / (w - w_q).abs().mean()):.2f} dB")
+    # Test codebook
+    print("\n2. Testing codebook...")
+    for bits in [1.58, 2.0, 4.0]:
+        cb = get_codebook(bits, CQ_GROUP_SIZE)
+        print(f"  bits={bits}: levels={len(cb)}, range=[{cb.min():.4f}, {cb.max():.4f}]")
     
-    # Test STE
-    w = torch.randn(10, 20, requires_grad=True)
+    # Test round-trip
+    print("\n3. Testing round-trip quantization...")
+    torch.manual_seed(42)
+    w = torch.randn(1024, 512)
+    w_q = cq_quantize(w, bits=2.0, group_size=128)
+    error = (w - w_q).abs().max() / w.abs().max()
+    mse = (w - w_q).pow(2).mean() / w.pow(2).mean()
+    print(f"  max_rel_error={error:.6f}, mse_rel={mse:.6f}")
+    
+    # Test STE gradient
+    print("\n4. Testing STE gradient...")
+    w = torch.randn(128, 256, requires_grad=True)
     w_q = cq_ste_simple(w, bits=2.0, group_size=128)
     loss = w_q.sum()
     loss.backward()
-    print(f"STE gradient received: {w.grad is not None}")
-    print(f"Gradient shape: {w.grad.shape}")
+    print(f"  grad norm: {w.grad.norm():.4f}, close to 1: {torch.allclose(w.grad, torch.ones_like(w.grad), atol=1e-3)}")
     
-    # Test QuantizedLinear
-    print("\nTesting CQQuantizedLinear...")
-    layer = CQQuantizedLinear(768, 3072, bits=2.0, group_size=128)
-    x = torch.randn(2, 128, 768)
-    
-    # Training mode (QAT)
-    layer.train()
-    y = layer(x)
-    print(f"Training forward: {y.shape}")
-    loss = y.sum()
-    loss.backward()
-    print(f"Gradients received: {layer.weight.grad is not None}")
-    
-    # Inference mode
-    layer.prepare_for_inference()
-    layer.eval()
+    # Test quantized linear
+    print("\n5. Testing CQQuantizedLinear...")
+    linear = CQQuantizedLinear(512, 1024, bits=2.0, group_size=128)
+    x = torch.randn(2, 32, 512, dtype=torch.bfloat16)
+    linear.train()
+    out = linear(x)
+    print(f"  train out: shape={out.shape}, dtype={out.dtype}")
+    linear.prepare_for_inference()
+    linear.eval()
     with torch.no_grad():
-        y = layer(x)
-    print(f"Inference forward: {y.shape}")
+        out_inf = linear(x)
+    print(f"  inf out: shape={out_inf.shape}, dtype={out_inf.dtype}")
+    
+    # Test quantized embedding
+    print("\n6. Testing CQQuantizedEmbedding...")
+    emb = CQQuantizedEmbedding(10000, 512, bits=2.0, group_size=128)
+    x = torch.randint(0, 10000, (2, 32), dtype=torch.long)
+    emb.train()
+    out = emb(x)
+    print(f"  train out: shape={out.shape}, dtype={out.dtype}")
+    emb.prepare_for_inference()
+    emb.eval()
+    with torch.no_grad():
+        out_inf = emb(x)
+    print(f"  inf out: shape={out_inf.shape}, dtype={out_inf.dtype}")
     
     print("\nAll tests passed!")
