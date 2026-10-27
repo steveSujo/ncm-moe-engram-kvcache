@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
 from omegaconf import OmegaConf
+import os
 
 from models.common import Block, SelfAttention, MLP, RMSNorm
 from models.engram import EngramModule, needle2_engram_config, engram_geometry
@@ -26,7 +27,7 @@ class MoEEngramNextConceptTransformer(nn.Module):
     Enhanced NCM Generator with:
     - MoE FFN layers (paged from SSD)
     - Engram memory at layers 2, 15
-    - Bounded KV cache with attention sinks
+    - Bounded KV cache (256 window + 1 sink + INT8)
     """
     
     def __init__(
@@ -45,6 +46,7 @@ class MoEEngramNextConceptTransformer(nn.Module):
         self.vqvae_local = vqvae_local
         self.config = config
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.expert_dir = expert_dir
         
         # Extract model params
         self.n_layer = config.n_layer
@@ -59,11 +61,9 @@ class MoEEngramNextConceptTransformer(nn.Module):
         vocab_size_0 = int(config.vocab_size[0]) if hasattr(config.vocab_size, '__getitem__') else int(config.vocab_size)
         self.wte = nn.Embedding(vocab_size_0, config.n_embd)
         self.wle = nn.Embedding(len(config.vocab_size), config.n_embd) if config.use_level_encoding else None
-        self.wpe = nn.Embedding(config.context_length, config.n_embd) if config.use_positional_encoding else None
-        
-        # Dropout
+        # Use expanded length from VQ-VAE (640) for positional encoding
+        self.wpe = nn.Embedding(640, config.n_embd) if config.use_positional_encoding else None
         self.drop = nn.Dropout(config.dropout)
-        
         # Transformer blocks
         self.blocks = nn.ModuleList([
             Block(config) for _ in range(config.n_layer)
@@ -94,6 +94,9 @@ class MoEEngramNextConceptTransformer(nn.Module):
             nn.Linear(codebook_dim, vs, bias=False) for vs in config.vocab_size
         ])
         
+        # Projection from codebook dim to model dim (matches NCM transformer.wte: [768, 384])
+        self.proj_from_codebook = nn.Linear(codebook_dim, config.n_embd, bias=False)
+        
         # Projection from model dim to codebook dim
         self.proj_to_codebook = nn.Linear(config.n_embd, codebook_dim, bias=False)
         engram_cfg = engram_config or needle2_engram_config()
@@ -105,10 +108,7 @@ class MoEEngramNextConceptTransformer(nn.Module):
                 engram_cfg["slots"], engram_cfg["conv_taps"],
                 engram_cfg["conv_dilation"]
             )
-            for _ in self.engram_layers
         ])
-        
-        # KV Cache
         kv_cfg = kv_cache_config or {}
         self.kv_cache = MultiLayerKVCache(
             n_layers=config.n_layer,
@@ -117,7 +117,6 @@ class MoEEngramNextConceptTransformer(nn.Module):
             n_kv_heads=kv_cfg.get("n_kv_heads", config.n_head),  # MHA for compatibility
             head_dim=kv_cfg.get("head_dim", config.n_embd // config.n_head),
         )
-        
         # Initialize weights
         self.apply(self._init_weights)
         
@@ -132,14 +131,9 @@ class MoEEngramNextConceptTransformer(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
-        elif isinstance(module, RMSNorm):
-            nn.init.ones_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
     
     def _tie_heads_to_codebook(self):
         """Tie output heads to VQ codebook embeddings."""
-        # Get codebook embeddings from VQ-VAE
         codebooks = self.vqvae_local.get_codebooks()  # [n_levels, vocab_size, embed_dim]
         for level, head in enumerate(self.lm_heads):
             if level < len(codebooks):
@@ -147,24 +141,111 @@ class MoEEngramNextConceptTransformer(nn.Module):
     
     def forward(
         self,
-        idx: torch.Tensor,  # [B, L] or [B, T] token indices
+        x: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        kv_cache: Optional[MultiLayerKVCache] = None,
+    ):
+        """Main forward - dispatches to multilevel if input is 3D (concatenated), else single level."""
+        if x.dim() == 3:
+            return self.forward_multilevel(x, targets)
+        else:
+            # Single level forward (for generation) - x is [B, T] token indices
+            # Need to know which level - default to level 0
+            return self.forward_single_level(x, level=0, targets=targets, kv_cache=kv_cache)
+    def forward_multilevel(
+        self,
+        x: torch.Tensor,  # [B, sum_levels, embed_dim] concatenated multi-level codes
+        targets: Optional[torch.Tensor] = None,  # [B, sum_levels] flattened
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Forward pass for all levels simultaneously (NCM style).
+        
+        Args:
+            x: [B, sum_levels, embed_dim] concatenated multi-level codes from VQ-VAE
+            targets: [B, sum_levels] flattened target indices for all levels
+        Returns:
+            logits: [B, sum_levels, vocab_size] concatenated logits for all levels
+            loss: scalar if targets provided
+        """
+        B, sum_T, embed_dim = x.shape
+        device = x.device
+        dtype = next(self.parameters()).dtype
+        
+        # x is already flattened: [B, sum_levels, embed_dim]
+        x_flat = x
+        
+        # Project from VQ-VAE codebook dim (384) to model dim (768)
+        # This matches NCM's transformer.wte: [768, 384]
+        x_flat = self.proj_from_codebook(x_flat)
+        
+        # Add level embeddings using lvl_1L (like NCM)
+        if self.wle is not None and hasattr(self, 'lvl_1L'):
+            lvl_emb = self.wle(self.lvl_1L).squeeze(0)  # [sum_levels, n_embd]
+            x_flat = x_flat + lvl_emb.unsqueeze(0)
+        elif self.wle is not None:
+            # Fallback: create level indices
+            level_indices = torch.arange(len(self.vocab_size), device=device).repeat_interleave(
+                torch.tensor([min(128, vs) for vs in self.vocab_size], device=device)
+            )
+            lvl_emb = self.wle(level_indices)  # [sum_levels, n_embd]
+            x_flat = x_flat + lvl_emb.unsqueeze(0)
+        # Add positional embeddings
+        if self.wpe is not None:
+            pos = torch.arange(sum_T, device=device).unsqueeze(0)
+            pos_emb = self.wpe(pos)
+            x_flat = x_flat + pos_emb
+        
+        x_flat = self.drop(x_flat)
+        x_flat = x_flat.to(dtype)
+        
+        # Forward through blocks
+        for i, block in enumerate(self.blocks):
+            # Engram injection at specified layers
+            if i in self.engram_layers:
+                engram_idx = self.engram_layers.index(i)
+                # For Engram, we need token indices - use level info
+                # Create dummy token indices for hashing with correct batch size
+                dummy_idx = torch.arange(sum_T, device=device).unsqueeze(0).expand(B, -1)  # [B, sum_T]
+                engram_out = self.engrams[engram_idx].apply_engam(x_flat, dummy_idx)
+                x_flat = engram_out
+            
+            # Block forward (without KV cache for training)
+            x_flat = block(x_flat, kv_cache=None, layer_idx=i)
+        
+        x_flat = self.ln_f(x_flat)
+        
+        # Project to codebook dimension
+        x_flat = self.proj_to_codebook(x_flat)
+        
+        # Apply level-specific heads
+        # Need to split by level boundaries
+        logits_list = []
+        start = 0
+        for level in range(len(self.vocab_size)):
+            level_T = self.vocab_size[level]
+            level_T = min(level_T, 128)  # cap at context length
+            end = start + level_T
+            level_x = x_flat[:, start:end, :]
+            level_logits = self.lm_heads[level](level_x)  # [B, level_T, vocab_size]
+            logits_list.append(level_logits)
+            start = end
+        
+        logits = torch.cat(logits_list, dim=1)  # [B, sum_levels, vocab_size]
+        
+        loss = None
+        if targets is not None:
+            # targets is [B, sum_levels] flattened
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        
+        return logits, loss
+    
+    def forward_single_level(
+        self,
+        idx: torch.Tensor,  # [B, T] token indices
         level: int = 0,
         targets: Optional[torch.Tensor] = None,
         kv_cache: Optional[MultiLayerKVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass for a single level.
-        
-        Args:
-            idx: [B, T] token indices for current level
-            level: which level (0-10)
-            targets: [B, T] target tokens for loss
-            kv_cache: optional KV cache for autoregressive generation
-        Returns:
-            logits: [B, T, vocab_size]
-            loss: scalar if targets provided
-        """
-        B, T = idx.shape
         device = idx.device
         dtype = next(self.parameters()).dtype
         
@@ -254,7 +335,7 @@ class MoEEngramNextConceptTransformer(nn.Module):
             ctx = torch.cat(generated, dim=-1)  # [B, sum_T]
             
             # Forward with KV cache
-            logits, _ = self.forward(ctx, level=level, kv_cache=self.kv_cache if use_kv_cache else None)
+            logits, _ = self.forward_single_level(ctx, level=level, kv_cache=self.kv_cache if use_kv_cache else None)
             
             # Sample next token
             logits = logits[:, -1, :] / temperature  # [B, vocab]
@@ -279,20 +360,26 @@ class MoEEngramNextConceptTransformer(nn.Module):
         return torch.cat(generated, dim=-1)
     
     def load_pretrained_weights(self, checkpoint_path: str):
-        """Load pretrained dense weights and convert to MoE."""
+        """Load pretrained dense weights and convert to MoE.
+        
+        Note: NCM architecture differs from our MoE+Engram architecture:
+        - NCM transformer.wte: [768, 384] projects codebook_dim -> n_embd (NOT token embedding)
+        - NCM lm_heads: [384, 768] projects n_embd -> codebook_dim (tied to codebook)
+        - Our wte: [vocab_size_0, n_embd] token embedding for level 0
+        - Our lm_heads: [n_embd, vocab_size] output heads
+        
+        So we only load compatible parts: attention, layernorms, wle, wpe.
+        Experts are initialized from dense MLP via k-means.
+        """
         ckpt = torch.load(checkpoint_path, map_location='cpu')
         state_dict = ckpt['model']
         
-        # Load embeddings
-        self.wte.load_state_dict({
-            'weight': state_dict['transformer.wte.weight'],
-            'bias': state_dict['transformer.wte.bias'] if 'transformer.wte.bias' in state_dict else None
-        })
-        
-        if self.wle is not None:
+        # Load level embedding (compatible: [11, 768])
+        if self.wle is not None and 'transformer.wle.weight' in state_dict:
             self.wle.load_state_dict({'weight': state_dict['transformer.wle.weight']})
         
-        if self.wpe is not None:
+        # Load positional embedding (compatible: [129, 768])
+        if self.wpe is not None and 'transformer.wpe.weight' in state_dict:
             self.wpe.load_state_dict({'weight': state_dict['transformer.wpe.weight']})
         
         # Load transformer blocks (attention + layernorms)
@@ -305,38 +392,36 @@ class MoEEngramNextConceptTransformer(nn.Module):
             block.attn.q_norm.weight.data = state_dict[f'transformer.blocks.{i}.attn.q_norm.weight']
             block.attn.k_norm.weight.data = state_dict[f'transformer.blocks.{i}.attn.k_norm.weight']
             
-            # Layer norms
+            # Layer norms - NCM uses LayerNorm with bias, we use RMSNorm (no bias)
             block.ln_1.load_state_dict({
                 'weight': state_dict[f'transformer.blocks.{i}.ln_1.weight'],
-                'bias': state_dict[f'transformer.blocks.{i}.ln_1.bias'],
-            })
+            }, strict=False)
             block.ln_2.load_state_dict({
                 'weight': state_dict[f'transformer.blocks.{i}.ln_2.weight'],
-                'bias': state_dict[f'transformer.blocks.{i}.ln_2.bias'],
-            })
+            }, strict=False)
             
             # Initialize MoE experts from dense MLP (k-means)
             dense_fc = state_dict[f'transformer.blocks.{i}.mlp.c_fc.weight']  # [3072, 768]
             dense_proj = state_dict[f'transformer.blocks.{i}.mlp.c_proj.weight']  # [768, 3072]
             self._init_experts_from_dense(i, dense_fc, dense_proj)
         
-        # Final norm
+        # Final norm - NCM uses LayerNorm with bias, we use RMSNorm (no bias)
         self.ln_f.load_state_dict({
             'weight': state_dict['transformer.ln_f.weight'],
-            'bias': state_dict['transformer.ln_f.bias'],
-        })
-        
-        # LM heads
-        for level in range(len(self.vocab_size)):
-            key = f'lm_heads.{level}.proj.weight'
-            if key in state_dict:
-                self.lm_heads[level].weight.data = state_dict[key]
+        }, strict=False)
         
         # lvl_1L if present
         if 'lvl_1L' in state_dict:
             self.register_buffer('lvl_1L', state_dict['lvl_1L'])
         
-        print("Loaded pretrained weights")
+        # Level 0 unigram for generation
+        if 'inference' in ckpt and 'level0_unigram' in ckpt['inference']:
+            self.register_buffer('level0_unigram', ckpt['inference']['level0_unigram'].to(self.device))
+        
+        # Tie heads to codebook (our architecture)
+        self._tie_heads_to_codebook()
+        
+        print("Loaded pretrained weights (compatible parts only)")
     
     def _init_experts_from_dense(self, layer_idx: int, dense_fc: torch.Tensor, dense_proj: torch.Tensor):
         """
@@ -344,7 +429,15 @@ class MoEEngramNextConceptTransformer(nn.Module):
         
         dense_fc: [3072, 768] - up projection
         dense_proj: [768, 3072] - down projection
+        
+        This is a fallback if expert checkpoints don't exist.
         """
+        # Check if experts already exist on disk
+        expert_path = os.path.join(self.expert_dir, f"layer{layer_idx}_expert0.safetensors")
+        if os.path.exists(expert_path):
+            print(f"Experts for layer {layer_idx} already exist, skipping k-means init")
+            return
+        
         from sklearn.cluster import KMeans
         import numpy as np
         
@@ -376,24 +469,6 @@ class MoEEngramNextConceptTransformer(nn.Module):
         pager = self.blocks[layer_idx].mlp.pager
         for e in range(64):
             expert_tensors = {
-                "gate": gate_centroids[e].unsqueeze(0),  # [1, 768] -> need [hidden, d_model]
-                "up": up_centroids[e].unsqueeze(0),
-                "down": down_centroids[:, e].unsqueeze(1),  # [768, 1] -> need [d_model, hidden]
-            }
-            # Reshape properly
-            expert_tensors = {
-                "gate": gate_centroids[e:e+1].T,  # [768, 1] -> transpose to [hidden, d_model]? No
-                "up": up_centroids[e:e+1].T,
-                "down": down_centroids[:, e:e+1],  # [768, 1]
-            }
-            # Actually: gate/up: [hidden, d_model], down: [d_model, hidden]
-            expert_tensors = {
-                "gate": gate_centroids[e].unsqueeze(0).expand(hidden, d_model).clone(),  # rough init
-                "up": up_centroids[e].unsqueeze(0).expand(hidden, d_model).clone(),
-                "down": down_centroids[:, e].unsqueeze(1).expand(d_model, hidden).clone(),
-            }
-            # Better: use centroid as mean, add noise
-            expert_tensors = {
                 "gate": gate_centroids[e].unsqueeze(0).repeat(hidden, 1) + torch.randn(hidden, d_model) * 0.01,
                 "up": up_centroids[e].unsqueeze(0).repeat(hidden, 1) + torch.randn(hidden, d_model) * 0.01,
                 "down": down_centroids[:, e].unsqueeze(1).repeat(1, hidden) + torch.randn(d_model, hidden) * 0.01,
@@ -403,11 +478,13 @@ class MoEEngramNextConceptTransformer(nn.Module):
 
 def create_moe_engram_model(config_path: str, expert_dir: str = "experts") -> MoEEngramNextConceptTransformer:
     """Factory function to create model from config."""
+    import os
     config = OmegaConf.load(config_path)
     
-    # Load tokenizer (frozen)
+    # Load tokenizer (frozen) - need base_dir for checkpoint paths
+    base_dir = os.path.dirname(config_path)
     from tokenization.vqvae_tokenizer import VQVAETokenizer
-    tokenizer = VQVAETokenizer.from_config(config.tokenizer)
+    tokenizer = VQVAETokenizer.from_config(config.tokenizer, base_dir=base_dir)
     tokenizer.vqvae.eval()
     for p in tokenizer.vqvae.parameters():
         p.requires_grad = False
@@ -419,7 +496,8 @@ def create_moe_engram_model(config_path: str, expert_dir: str = "experts") -> Mo
     )
     
     # Load pretrained weights
-    model.load_pretrained_weights(config.checkpoints.generator)
+    generator_path = os.path.join(base_dir, config.checkpoints.generator)
+    model.load_pretrained_weights(generator_path)
     
     return model
 
@@ -430,28 +508,19 @@ if __name__ == "__main__":
     from omegaconf import OmegaConf
     
     config = OmegaConf.load('artifacts/tinystories/config.yaml')
-    print("Config loaded")
+    model = create_moe_engram_model('artifacts/tinystories/config.yaml', expert_dir='experts')
+    print(f"Model created: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
     
-    # Create model (without tokenizer for quick test)
-    from unittest.mock import MagicMock
-    mock_vqvae = MagicMock()
-    mock_vqvae.get_codebooks.return_value = [torch.randn(4096, 384) for _ in range(11)]
-    mock_vqvae.get_unigram.return_value = torch.ones(4096) / 4096
+    # Test forward_multilevel
+    B, T = 2, 128
+    num_levels = len(config.model.vocab_size)
+    x = torch.randn(B, num_levels, T, 384)
+    targets = torch.randint(0, 4096, (B, num_levels * T))
     
-    model = MoEEngramNextConceptTransformer(
-        vqvae_local=mock_vqvae,
-        config=config.model,
-        expert_dir="experts",
-    )
-    print(f"Model created: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+    model.eval()
+    with torch.no_grad():
+        logits, loss = model.forward_multilevel(x, targets)
     
-    # Test forward
-    x = torch.randint(0, 4096, (2, 128))
-    logits, loss = model(x, level=1)
-    print(f"Forward: logits={logits.shape}, loss={loss}")
-    
-    # Test generate
-    out = model.generate(torch.randint(0, 4096, (1, 1)), max_levels=3)
-    print(f"Generate: {out.shape}")
-    
+    print(f"Logits shape: {logits.shape}")
+    print(f"Loss: {loss.item():.4f}")
     print("Model test passed!")

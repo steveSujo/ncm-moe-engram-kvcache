@@ -17,6 +17,8 @@ from tokenization.vqvae_tokenizer import VQVAETokenizer
 from models.moe_engram_generator import MoEEngramNextConceptTransformer
 from models.moe_block import MoEBlock
 from utils.expert_io import MoEPager
+
+
 def load_vqvae(checkpoint_dir: str = "artifacts/tinystories"):
     """Load frozen VQ-VAE tokenizer."""
     config_path = os.path.join(checkpoint_dir, "config.yaml")
@@ -71,6 +73,7 @@ def load_model(
     
     return model, pager
 
+
 @torch.no_grad()
 def generate(
     model,
@@ -85,24 +88,33 @@ def generate(
 ):
     """Generate text from prompt."""
     
-    # Encode prompt
+    # Encode prompt to BPE tokens
     if hasattr(tokenizer, 'encode'):
-        prompt_tokens = tokenizer.encode(prompt)
+        prompt_bpe = tokenizer.encode(prompt)
     else:
-        # Fallback: use VQ-VAE tokenizer
-        prompt_tokens = tokenizer.vqvae.get_ncm_inputs(prompt)
+        raise ValueError("Tokenizer must have encode method")
     
     # Convert to tensor
-    if isinstance(prompt_tokens, list):
-        prompt_tokens = torch.tensor(prompt_tokens, dtype=torch.long).unsqueeze(0)
+    if isinstance(prompt_bpe, list):
+        prompt_bpe = torch.tensor(prompt_bpe, dtype=torch.long).unsqueeze(0)
+    elif prompt_bpe.dim() == 1:
+        prompt_bpe = prompt_bpe.unsqueeze(0)
     
-    prompt_tokens = prompt_tokens.to(device)
+    prompt_bpe = prompt_bpe.to(device)
     
-    print(f"Prompt tokens shape: {prompt_tokens.shape}")
+    print(f"Prompt BPE shape: {prompt_bpe.shape}")
+    # The model expects level 0 tokens as input
+    # Use VQ-VAE to get the level 0 codes for the prompt
+    with torch.no_grad():
+        # For generation, we need to encode the prompt through VQ-VAE to get level codes
+        # But the model's generate() expects level 0 tokens directly
+        # So we'll use the unigram sampling for level 0 and then generate levels 1+
+        pass
     
-    # Generate using model's generate method
-    generated = model.generate(
-        prompt_tokens,
+    # Generate multi-level codes using model
+    # Model generates level 0 + max_levels-1 more levels
+    generated_codes = model.generate(
+        prompt_bpe[:, :1],  # Use first token as seed for level 0
         l0=None,
         temperature=temperature,
         top_k=top_k,
@@ -111,12 +123,27 @@ def generate(
         max_levels=max_levels,
     )
     
-    print(f"Generated shape: {generated.shape}")
+    print(f"Generated codes shape: {generated_codes.shape}")
+    print(f"Level 0 token IDs: {generated_codes[0].cpu().tolist()}")
     
-    # Decode - we get level 0 tokens (unigram)
-    # For full decoding, would need VQ-VAE decoder
-    return generated
-
+    # Now decode using VQ-VAE decoder
+    # generated_codes is [B, total_tokens] where each level has 1 token (autoregressive)
+    # We need to split by level and decode
+    # Each level generates 1 token per step, so we have max_levels tokens total
+    # Reshape: [B, max_levels] -> split per level
+    level_codes = []
+    for i in range(max_levels):
+        level_codes.append(generated_codes[:, i:i+1])
+    
+    # Decode using VQ-VAE decoder
+    with torch.no_grad():
+        bpe_logits = tokenizer.vqvae.decode_codes(level_codes)  # [B, T, vocab]
+        bpe_tokens = bpe_logits.argmax(dim=-1)  # [B, T]
+        text = tokenizer.decode(bpe_tokens[0])
+    
+    print(f"Decoded text: {text}")
+    
+    return generated_codes, text
 
 def main():
     parser = argparse.ArgumentParser(description="MoE+Engram NCM Inference")
@@ -160,11 +187,9 @@ def main():
     )
     
     print(f"Model loaded: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
-    print(f"Pager: {pager}")
-    
     # Generate
     print(f"\nGenerating from prompt: '{args.prompt}'")
-    generated = generate(
+    generated_codes, generated_text = generate(
         model=model,
         tokenizer=tokenizer,
         prompt=args.prompt,
@@ -177,8 +202,9 @@ def main():
     )
     
     print(f"\nGeneration complete!")
-    print(f"Output shape: {generated.shape}")
-    print(f"First 20 tokens: {generated[0, :20].tolist()}")
+    print(f"Output shape: {generated_codes.shape}")
+    print(f"First 20 tokens: {generated_codes[0, :20].tolist()}")
+    print(f"Generated text: {generated_text}")
     
     # Log paging stats
     if hasattr(model, 'kv_cache'):

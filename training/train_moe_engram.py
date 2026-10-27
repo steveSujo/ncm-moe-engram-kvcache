@@ -68,8 +68,14 @@ class TinyStoriesDataset(Dataset):
         # Flatten into chunks of context_length
         self.chunks = []
         for seq in self.data:
-            for i in range(0, len(seq) - context_length, context_length // 2):
-                self.chunks.append(seq[i:i + context_length])
+            # Ensure we have enough tokens
+            if len(seq) >= context_length:
+                for i in range(0, len(seq) - context_length + 1, context_length // 2):
+                    self.chunks.append(seq[i:i + context_length])
+            else:
+                # Pad if needed
+                padded = seq + [0] * (context_length - len(seq))
+                self.chunks.append(padded[:context_length])
         logger.info(f"Dataset: {len(self.chunks)} chunks of length {context_length}")
     def __len__(self):
         return len(self.chunks)
@@ -91,9 +97,15 @@ def prepare_dataset():
         allow_patterns=["tinystories/*"]
     )
     
-    # The dataset should have train.pkl
-    return "data/tinystories/tinystories/train.pkl"
-
+    # The dataset should have train.pkl - check both locations
+    path1 = "data/tinystories/tinystories/train.pkl"
+    path2 = "data/tinystories/train.pkl"
+    if os.path.exists(path1):
+        return path1
+    elif os.path.exists(path2):
+        return path2
+    else:
+        raise FileNotFoundError(f"Dataset not found at {path1} or {path2}")
 
 def get_optimizer(model, lr_trunk=3e-4, lr_engram=1e-4, lr_expert=3e-3, weight_decay=0.1):
     """
@@ -157,29 +169,24 @@ def train_step(model, batch, tokenizer, optimizer, scaler, accum_steps, step):
     # Get NCM inputs from tokenizer (VQ-VAE encoding)
     with torch.no_grad():
         x, targets = tokenizer.vqvae.get_ncm_inputs(batch)
-        # x: [B, L, D] multi-level tokens
-        # targets: [B, 128] flattened targets for all levels
+        # x: [B, num_levels, T, embed_dim] multi-level quantized codes
+        # targets: [B, sum_levels] flattened target indices for all levels
     
     # Forward with autocast
     with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.bfloat16):
-        # Multi-level forward
-        total_loss = 0
-        router_losses = []
+        # NCM processes all levels simultaneously with block-diagonal attention
+        # Forward returns logits for all levels concatenated and loss
+        logits, loss = model(x, targets=targets)
         
-        # For each level, compute logits and loss
-        # This is simplified - actual NCM generates level by level
-        for level in range(len(model.vocab_size)):
-            logits, loss = model(x, level=level, targets=targets)
-            total_loss += loss
-            
-            # Collect router losses from MoE blocks
-            for block in model.blocks:
-                if hasattr(block.mlp, 'router_loss'):
-                    router_losses.append(block.mlp.router_loss)
+        # Collect router losses from MoE blocks
+        router_losses = []
+        for block in model.blocks:
+            if hasattr(block.mlp, 'router_loss'):
+                router_losses.append(block.mlp.router_loss)
         
         # Average router loss
         router_loss = torch.stack(router_losses).mean() if router_losses else torch.tensor(0.0, device=device)
-        total_loss = total_loss + 0.01 * router_loss
+        total_loss = loss + 0.01 * router_loss
     
     # Backward
     scaler.scale(total_loss / accum_steps).backward()
@@ -199,8 +206,6 @@ def train_step(model, batch, tokenizer, optimizer, scaler, accum_steps, step):
         optimizer.zero_grad(set_to_none=True)
     
     return total_loss.item(), router_loss.item()
-
-
 def save_checkpoint(model, optimizer, scheduler, step, path):
     """Save training checkpoint."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -221,14 +226,19 @@ def save_checkpoint(model, optimizer, scheduler, step, path):
 def main():
     # Config
     config = OmegaConf.load('artifacts/tinystories/config.yaml')
-    
     # Model
     logger.info("Creating model...")
-    model = create_moe_engram_model('artifacts/tinystories/config.yaml', expert_dir='experts')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = create_moe_engram_model('artifacts/tinystories/config.yaml', expert_dir='experts')
     model = model.to(device)
     
-    logger.info(f"Model on {device}: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+    # Also load tokenizer for encoding
+    from tokenization.vqvae_tokenizer import VQVAETokenizer
+    tokenizer = VQVAETokenizer.from_config(config.tokenizer, base_dir='artifacts/tinystories')
+    tokenizer.vqvae.eval()
+    for p in tokenizer.vqvae.parameters():
+        p.requires_grad = False
+    tokenizer.vqvae.to(device)
     # Dataset
     logger.info("Preparing dataset...")
     data_path = prepare_dataset()
@@ -251,7 +261,7 @@ def main():
     
     for epoch in range(100):  # enough epochs
         for batch in tqdm(dataloader, desc=f"Epoch {epoch}"):
-            loss, router_loss = train_step(model, batch, model.vqvae_local, optimizer, scaler, accum_steps, step)
+            loss, router_loss = train_step(model, batch, tokenizer, optimizer, scaler, accum_steps, step)
             
             if (step + 1) % accum_steps == 0:
                 scheduler.step()
