@@ -37,11 +37,14 @@ class MoEEngramNextConceptTransformer(nn.Module):
         resident_slots: int = 32,
         engram_config: Optional[dict] = None,
         kv_cache_config: Optional[dict] = None,
+        pager: Optional["MoEPager"] = None,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
         
         self.vqvae_local = vqvae_local
         self.config = config
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Extract model params
         self.n_layer = config.n_layer
@@ -67,19 +70,22 @@ class MoEEngramNextConceptTransformer(nn.Module):
         ])
         
         # Replace MLP with MoEBlock
-        pager = MoEPager(
-            expert_dir=expert_dir,
-            resident_slots=resident_slots,
-            n_layers=config.n_layer,
-            n_experts=64,
-            d_model=config.n_embd,
-            expert_hidden=3072,
-        )
+        if pager is None:
+            from utils.expert_io import MoEPager
+            pager = MoEPager(
+                expert_dir=expert_dir,
+                resident_slots=resident_slots,
+                n_layers=config.n_layer,
+                n_experts=64,
+                d_model=config.n_embd,
+                expert_hidden=3072,
+                device=self.device,
+            )
         
         for i, block in enumerate(self.blocks):
             block.mlp = MoEBlock(config, layer_idx=i, pager=pager)
         
-        # Layer norm
+        self.pager = pager
         self.ln_f = RMSNorm(config.n_embd)
         
         # Output heads (tied to codebook - 384 dim from VQ-VAE)

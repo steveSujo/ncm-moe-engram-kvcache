@@ -220,17 +220,23 @@ def swiglu_forward(x: torch.Tensor, expert_tensors: Dict[str, torch.Tensor]) -> 
     
     Args:
         x: [*, d_model]
-        expert_tensors: dict with 'gate', 'up', 'down' weights
+        expert_tensors: dict with 'gate'/'gate_weight', 'up'/'up_weight', 'down'/'down_weight' weights
     Returns:
         out: [*, d_model]
     """
-    gate = F.linear(x, expert_tensors["gate"])  # [*, expert_hidden]
-    up = F.linear(x, expert_tensors["up"])       # [*, expert_hidden]
+    # Match dtype, handle both naming conventions
+    target_dtype = x.dtype
+    
+    # Support both naming conventions
+    gate_w = expert_tensors.get("gate", expert_tensors.get("gate_weight")).to(target_dtype)
+    up_w = expert_tensors.get("up", expert_tensors.get("up_weight")).to(target_dtype)
+    down_w = expert_tensors.get("down", expert_tensors.get("down_weight")).to(target_dtype)
+    
+    gate = F.linear(x, gate_w)  # [*, expert_hidden]
+    up = F.linear(x, up_w)       # [*, expert_hidden]
     hidden = F.silu(gate) * up                   # [*, expert_hidden]
-    down = F.linear(hidden, expert_tensors["down"])  # [*, d_model]
+    down = F.linear(hidden, down_w)  # [*, d_model]
     return down
-
-
 if __name__ == "__main__":
     # Quick test
     import tempfile

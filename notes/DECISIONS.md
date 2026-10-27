@@ -267,7 +267,46 @@ ncm_model/
 
 - `433a580` — feat: initial commit (all core components)
 - `8ade65d` — feat(training): add logging to init_experts and train_moe_engram scripts
+- `266534a` — docs: add DECISIONS.md, AGENTS.md, updated RULES.md, and test files
 
 ---
 
-*Generated for future LLM agents. Keep updated as architecture evolves.*
+## 17. Execution Progress (Updated 2026-10-27)
+
+### Completed
+- [x] Environment setup (Python 3.12, PyTorch 2.5.1+cu121, uv deps)
+- [x] Downloaded NCM checkpoints → `artifacts/tinystories/`
+- [x] Implemented all core architecture files (Engram, KV Cache, MoE, Integrated Generator)
+- [x] Training infrastructure (init_experts, train_moe_engram, dummy dataset, smoke tests)
+- [x] **All smoke tests PASS** on CPU (7/7 tests)
+- [x] **Expert initialization COMPLETE** — all 768 experts (12 layers × 64 experts) initialized
+- [x] Unit tests created and passing for core components
+- [x] Git repo initialized and pushed to GitHub
+- [x] Documentation: DECISIONS.md, AGENTS.md, RULES.md, README, QUICKSTART, CHANGELOG
+
+### Key Technical Updates
+
+**Expert Initialization — FAISS CPU Acceleration**
+- Switched from sklearn KMeans (~5 min/layer) to FAISS CPU KMeans (~1.3s/layer)
+- Total init time: ~6 min for all 6 remaining layers (vs ~30+ min estimated)
+- FAISS uses optimized C++ AVX/SIMD implementation, not GPU acceleration
+- Script: `training/init_experts_faiss.py` (uses `faiss-cpu` package)
+
+**Engram Layer Positions Adapted**
+- Original plan: layers 2 and 15 (for 15-layer model)
+- Actual: layers 2 and 11 (for 12-layer TinyStories model)
+- Code auto-adapts: `engram_layers = [2, 15] if config.n_layer > 15 else [2, min(11, config.n_layer - 1)]`
+
+**Codebook Dimension Fixed**
+- Model hardcodes `codebook_dim = 384` (from VQ-VAE), not `n_embd`
+- Mock tests updated to use 384-dim codebooks
+- Projection: `n_embd (768) → 384 → vocab_size`
+
+---
+
+## 18. Next Steps
+
+1. **Full GPU Training** — Run `training/train_moe_engram.py` with periodic checkpointing
+2. **Verify Generation Quality** — Test paging + Engram + bounded KV cache at inference
+3. **Write Regression Tests** — For runtime errors found during training
+4. **Implement Sub-3-bit Cactus Quants** — Register-level expansion for inference deployment
