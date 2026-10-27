@@ -1,161 +1,138 @@
-# Quickstart Guide
+# psudo-Engine Quickstart
 
-Get the NCM-MoE-Engram-KVCache model running in 5 minutes.
+Get the psudo-Engine running in 5 minutes.
 
 ## 1. Environment Setup (30s)
 
 ```bash
 # Clone and enter
-git clone <your-repo-url>
+git clone https://github.com/steveSujo/ncm-moe-engram-kvcache.git
 cd ncm_model
 
+# Switch to the psudo-engine branch
+git checkout psudo-engine-rewrite
+
 # Install dependencies
+uv venv .venv
 uv pip install -r requirements.txt
+
+# Optional: for synthetic data generation
+uv pip install numpy
 ```
 
-## 2. Download Checkpoints (1-2 min)
+## 2. Quick Test (CPU)
 
 ```bash
-# Option A: HuggingFace CLI
-hf download hazyresearch/ncm-checkpoints --local-dir artifacts
-
-# Option B: Python (if CLI not available)
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id='hazyresearch/ncm-checkpoints', local_dir='artifacts', local_dir_use_symlinks=False)
+# Run a generation demo (uses random weights - output will be garbage)
+PYTHONPATH=. .venv/Scripts/python.exe -c "
+from psudo_engine.inference.cli import main
+import sys
+sys.argv = ['cli.py', '--prompt', 'fn main() {', '--max-tokens', '20']
+main()
 "
 ```
 
-Expected structure after download:
-```
-artifacts/
-└── tinystories/
-    ├── config.yaml
-    ├── tokenizer.pt      # VQ-VAE tokenizer (221 MB)
-    ├── generator.pt      # Dense NCM generator (356 MB)
-    ├── bpe_vocab_8192.pickle
-    └── bpe_merges_8192.pickle
-```
+**Expected**: Generates garbage text (model is randomly initialized).
 
-## 3. Initialize Experts (2-3 min)
+## 3. Run Tests
 
 ```bash
-PYTHONPATH=. .venv/Scripts/python.exe training/init_experts.py
+# All tests (13 integration tests)
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/ -v
+
+# Integration tests only (13 tests)
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_integration.py -v
+
+# Unit tests
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_weight_paging.py -v
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_context.py -v
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_model.py -v
 ```
 
-Creates `experts/` with 768 expert files (12 layers × 64 experts):
-```
-experts/
-├── expert_index.json
-├── layer0_expert0.safetensors
-├── ...
-└── layer11_expert63.safetensors
-```
+**Expected**: 10/13 integration tests pass (3 expected failures without trained model)
 
-## 4. Verify Installation (30s)
+## 3. Run Benchmarks
 
 ```bash
-PYTHONPATH=. .venv/Scripts/python.exe training/smoke_tests.py
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/benchmarks/benchmark.py
 ```
 
 Expected output:
 ```
-============================================================
-RUNNING SMOKE TESTS
-============================================================
-
-==================================================
-Testing EngramModule...
-  Indices shape: torch.Size([2, 128, 8]) ✓
-  K, V shape: torch.Size([2, 128, 768]), torch.Size([2, 128, 768]) ✓
-  Application output: torch.Size([2, 128, 768]) ✓
-EngramModule test PASSED
-
-... (6 more tests) ...
-
-============================================================
-ALL SMOKE TESTS PASSED! ✓
-============================================================
+small (256d, 2L): 21 MB VRAM, 47 tok/s, 21ms/token
+medium (512d, 12L): 286 MB VRAM, 11 tok/s, 89ms/token
 ```
 
-## 5. Run a Training Step (optional, 1 min)
+## 4. CLI Demo
 
 ```bash
-PYTHONPATH=. .venv/Scripts/python.exe -c "
-import torch
-from omegaconf import OmegaConf
-from unittest.mock import MagicMock
-from models.moe_engram_generator import MoEEngramNextConceptTransformer
-from models.moe_block import MoEBlockNoPager
+# Generate
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/inference/cli.py generate --prompt "fn hello() -> string {" --checkpoint PATH_TO_CHECKPOINT
 
-config = OmegaConf.load('artifacts/tinystories/config.yaml')
-mock_vqvae = MagicMock()
-mock_vqvae.get_codebooks.return_value = [torch.randn(4096, 384, dtype=torch.bfloat16) for _ in range(11)]
-mock_vqvae.get_unigram.return_value = torch.ones(4096, dtype=torch.bfloat16) / 4096
-mock_vqvae.get_ncm_inputs.return_value = (torch.randint(0, 4096, (2, 128, 11)), torch.randint(0, 4096, (2, 128)))
+# Chat mode (interactive)
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/inference/cli.py chat --checkpoint PATH_TO_CHECKPOINT
 
-model = MoEEngramNextConceptTransformer(vqvae_local=mock_vqvae, config=config.model, expert_dir='experts')
-for i, block in enumerate(model.blocks):
-    block.mlp = MoEBlockNoPager(config.model, layer_idx=i, n_experts=8, expert_hidden=3072)
+# Model info
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/inference/cli.py info --config psudo_engine/config/model.yaml --checkpoint PATH_TO_CHECKPOINT
 
-model.train()
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-
-# One step
-batch = torch.randint(0, 8192, (2, 128))
-x, targets = mock_vqvae.get_ncm_inputs(batch)
-logits, loss = model(x[:, :, 1], level=1, targets=targets)
-loss.backward()
-optimizer.step()
-print(f'Training step loss: {loss.item():.4f}')
-"
+# Tokenize
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/inference/cli.py tokenize --text "fn test() { return 42 }" --encode
 ```
 
-## 6. Generate Text (optional, 10s)
+## Training (Requires Corpus)
 
 ```bash
-PYTHONPATH=. .venv/Scripts/python.exe -c "
-import torch
-from omegaconf import OmegaConf
-from unittest.mock import MagicMock
-from models.moe_engram_generator import MoEEngramNextConceptTransformer
-from models.moe_block import MoEBlockNoPager
+# Prepare data (generates synthetic data if no corpus)
+PYTHONPATH=. .venv/Scripts/python.exe -m psudo_engine.training.train --prepare-data
 
-config = OmegaConf.load('artifacts/tinystories/config.yaml')
-mock_vqvae = MagicMock()
-mock_vqvae.get_codebooks.return_value = [torch.randn(4096, 384, dtype=torch.bfloat16) for _ in range(11)]
-mock_vqvae.get_unigram.return_value = torch.ones(4096, dtype=torch.bfloat16) / 4096
-mock_vqvae.get_ncm_inputs.return_value = (torch.randint(0, 4096, (2, 128, 11)), torch.randint(0, 4096, (2, 128)))
+# Train
+PYTHONPATH=. .venv/Scripts/python.exe -m psudo_engine.training.train
 
-model = MoEEngramNextConceptTransformer(vqvae_local=mock_vqvae, config=config.model, expert_dir='experts')
-for i, block in enumerate(model.blocks):
-    block.mlp = MoEBlockNoPager(config.model, layer_idx=i, n_experts=8, expert_hidden=3072)
+# Resume from checkpoint
+PYTHONPATH=. .venv/Scripts/python.exe -m psudo_engine.training.train --resume checkpoints/checkpoint_step_1000.pt
 
-model.eval()
-with torch.no_grad():
-    out = model.generate(torch.tensor([[1]]), max_levels=3)  # Start with BOS=1
-    print(f'Generated tokens: {out.tolist()}')
-    print(f'Shape: {out.shape}')
-"
+# Override config
+PYTHONPATH=. .venv/Scripts/python.exe -m psudo_engine.training.train --max-steps 1000 --batch-size 8
 ```
 
----
+## Project Structure
+
+```
+psudo_engine/
+├── config/                 # YAML configs
+├── weight_paging/          # Weight paging subsystem
+├── context/                # Context/retrieval subsystem
+├── model/                  # Model architecture
+├── training/               # Training pipeline
+├── inference/              # Inference pipeline
+├── benchmarks/             # Benchmark suite
+├── tests/                  # Test suite
+├── data/                   # Data + shared schema (psudo-spec.json)
+└── docs/                   # Documentation
+```
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `config/model.yaml` | Model architecture |
+| `config/training.yaml` | Training hyperparameters |
+| `config/transpiler.yaml` | Transpiler config |
+| `psudo_engine/data/psudo-spec.json` | Shared schema (grammar, builtins, AST) |
+| `docs/sync_protocol.md` | Sync protocol docs |
 
 ## Troubleshooting
 
 | Issue | Fix |
 |-------|-----|
-| `ModuleNotFoundError: utils` | Run from repo root with `PYTHONPATH=.` |
-| `CUDA out of memory` | Reduce `resident_slots` in MoEPager (default 32 → 16) |
-| `Expert not found` | Re-run `init_experts.py` |
-| `dtype mismatch` | Ensure model and inputs are both BF16 |
-| Slow expert loading | Pre-load experts: `pager.ensure_resident(layer, list(range(64)))` |
-
----
+| `ModuleNotFoundError` | Run from repo root with `PYTHONPATH=.` |
+| `CUDA out of memory` | Reduce `resident_slots` in config |
+| `numpy not found` | `uv pip install numpy` (for synthetic data) |
+| Windows file locking | Run on Linux/WSL or close file handles |
+| `test_full_generation_pipeline` fails | Expected - model is untrained |
 
 ## Next Steps
 
-1. **Full training**: `PYTHONPATH=. .venv/Scripts/python.exe training/train_moe_engram.py`
-2. **Monitor**: Check `checkpoints/` for periodic saves
-3. **Evaluate**: Use trained checkpoint with real VQ-VAE tokenizer for generation
-4. **Scale**: Increase `resident_slots` if VRAM allows, or add more experts
+1. **Train a model**: Need psudo code corpus + `uv pip install numpy`
+2. **Evaluate**: Run benchmarks with trained checkpoint
+3. **Deploy**: Build `psudo-harness` (separate repo) for transpilation

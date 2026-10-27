@@ -1,45 +1,70 @@
-# Agent Instructions for NCM-MoE-Engram-KVCache
+# Agent Instructions for psudo-Engine
 
-This repository contains a Next-Concept Modeling (NCM) generator trained on 4GB VRAM using four complementary sparsity techniques:
-1. Frozen NCM tokenizer (HazyResearch VQ-VAE + residual VQ)
-2. MoE paging (64 experts/layer on SSD, 32 resident)
-3. Engram memory (Needle 2 style hashed n-gram lookup)
-4. Bounded KV cache (256-token window + INT8)
+This repository contains **psudo-Engine** — a paged-weight hybrid coding agent trained on 4GB VRAM using four complementary sparsity techniques:
+1. **Weight Paging** (mini-AGI style): 64 MoE experts/layer on SSD, 32 resident in VRAM
+2. **Ternary Quantization**: BitNet 1.58b ({-1, 0, +1}) with STE gradients
+3. **Engram Memory** (Needle 2 style): Hashed n-gram lookup (2-gram + 3-gram)
+4. **Bounded KV Cache** (Needle 2): 256-token sliding window + pinned sinks + INT8
+
+---
 
 ## Quick Start for Agents
 
 ```bash
 # Environment
 uv venv .venv
-set UV_CACHE_DIR=A:\uvcache && uv pip install -r requirements.txt
+uv pip install -r requirements.txt
 
-# Download checkpoints
-hf download hazyresearch/ncm-checkpoints --local-dir artifacts
+# Optional: for synthetic data generation
+uv pip install numpy
 
-# Initialize experts (one-time, ~60 min on CPU)
-PYTHONPATH=. .venv/Scripts/python.exe training/init_experts.py
+# Quick test (CPU, random weights)
+PYTHONPATH=. .venv/Scripts/python.exe -c "
+from psudo_engine.inference.cli import main
+import sys
+sys.argv = ['cli.py', '--prompt', 'fn hello() {', '--max-tokens', '20']
+main()
+"
 
-# Run smoke tests
-PYTHONPATH=. .venv/Scripts/python.exe training/smoke_tests.py
+# Run tests
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/ -v
 
-# Full training (requires GPU)
-PYTHONPATH=. .venv/Scripts/python.exe training/train_moe_engram.py
+# Run benchmarks
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/benchmarks/benchmark.py
 ```
+
+---
 
 ## Key Files
 
 | Purpose | File |
 |---------|------|
-| Main training | `training/train_moe_engram.py` |
-| Expert init | `training/init_experts.py` |
-| Integrated model | `models/moe_engram_generator.py` |
-| MoE block + router | `models/moe_block.py` |
-| Engram memory | `models/engram.py` |
-| Bounded KV cache | `models/kv_cache.py` |
-| Expert I/O (paging) | `utils/expert_io.py` |
-| Frozen tokenizer | `tokenization/vqvae_tokenizer.py` |
-| Base NCM | `models/common.py`, `models/next_concept.py` |
-| Smoke tests | `training/smoke_tests.py` |
+| **Model Config** | `config/model.yaml` |
+| **Training Config** | `config/training.yaml` |
+| **Transpiler Config** | `config/transpiler.yaml` |
+| **Shared Schema** | `psudo_engine/data/psudo-spec.json` |
+| **Sync Protocol** | `docs/sync_protocol.md` |
+
+| Component | File |
+|-----------|------|
+| **Main Training** | `psudo_engine/training/train.py` |
+| **Ternary Trainer** | `psudo_engine/training/ternary_trainer.py` |
+| **PsudoTransformer** | `psudo_engine/model/psudo_transformer.py` |
+| **MoE Block + Router** | `psudo_engine/model/moe.py` |
+| **Engram Memory** | `psudo_engine/model/engram.py` |
+| **Bounded KV Cache** | `psudo_engine/model/kv_cache.py` |
+| **Transformer Blocks** | `psudo_engine/model/blocks.py` |
+| **Attention** | `psudo_engine/model/attention.py` |
+| **Weight Paging** | `psudo_engine/weight_paging/` |
+| **Context/Retrieval** | `psudo_engine/context/` |
+| **Training Data** | `psudo_engine/training/psudo_dataset.py` |
+| **Feedback Dataset** | `psudo_engine/training/feedback_dataset.py` |
+| **Curriculum** | `psudo_engine/training/curriculum.py` |
+| **Inference Generator** | `psudo_engine/inference/generator.py` |
+| **Tokenizer** | `psudo_engine/inference/tokenizer.py` |
+| **CLI** | `psudo_engine/inference/cli.py` |
+
+---
 
 ## Rules (MANDATORY)
 
@@ -49,58 +74,92 @@ Read `.omp/RULES.md` before any operation. Key rules:
 - **Conventional commits**: `type(scope): description`
 - **Resume from logs**: Scripts skip completed work on restart
 
+---
+
 ## Common Tasks
 
-### Modify Engram Layers
-Edit `models/moe_engram_generator.py` line ~80: `engram_layers = [2, 11]`
+### Modify Model Config
+Edit `config/model.yaml`:
+```yaml
+model:
+  vocab_size: 8192
+  d_model: 512
+  n_layers: 24
+  n_heads: 8
+  head_dim: 64
+  n_experts: 64
+  top_k: 2
+  resident_slots: 32
+  engram_layers: [4, 12, 20]
+  engram_slots: 8192
+  engram_orders: [2, 3]
+  engram_heads: 4
+  max_window: 256
+  sink_tokens: 1
+  weight_bits: 1.58  # ternary
+```
 
 ### Change MoE Config
-Edit `models/moe_block.py` and `models/moe_engram_generator.py`:
-- `num_experts = 64`
+Edit `psudo_engine/model/moe.py`:
+- `n_experts = 64`
 - `top_k = 2`
-- `resident_slots = 32`
+- `capacity_factor = 1.25`
 
 ### Adjust KV Cache
-Edit `models/kv_cache.py` `BoundedKVCache.__init__`:
+Edit `psudo_engine/model/kv_cache.py`:
 - `max_window = 256`
 - `sink_tokens = 1`
 
 ### Change Optimizer LRs
-Edit `training/train_moe_engram.py` `get_optimizer()`:
-- Trunk: 3e-4
-- Engram tables: 1e-4
-- Experts: 3e-3
+Edit `psudo_engine/training/ternary_trainer.py`:
+```python
+trunk_lr: 3e-4      # attention, embeddings
+engram_lr: 1e-4     # engram tables
+expert_lr: 3e-3     # MoE experts (10× trunk)
+```
+
+---
 
 ## Testing
 
 ```bash
 # All tests
-PYTHONPATH=. .venv/Scripts/python.exe -m pytest training/ -v
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/ -v
 
-# Specific test file
-PYTHONPATH=. .venv/Scripts/python.exe -m pytest training/test_init_experts.py -v
-PYTHONPATH=. .venv/Scripts/python.exe -m pytest training/test_train.py -v
+# Integration tests (13 tests)
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_integration.py -v
 
-# Smoke tests only
-PYTHONPATH=. .venv/Scripts/python.exe training/smoke_tests.py
+# Unit tests
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_weight_paging.py -v
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_context.py -v
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_model.py -v
+
+# Benchmarks
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/benchmarks/benchmark.py
 ```
+
+---
 
 ## Logs
 
-- `expert_init.log` — expert initialization progress
-- `training.log` — training progress
+- `logs/training_YYYYMMDD_HHMMSS.log` — training progress
 - Check these if script appears stuck
+
+---
 
 ## Hardware Requirements
 
-- GPU: 6GB+ VRAM (tested on 6.44 GB GTX 1660 Ti)
-- RAM: 16GB+ system
-- SSD: 20GB+ free for experts + checkpoints
-- Disk: 10GB+ free on C: for uv cache
+- **GPU**: 4GB+ VRAM (tested on GTX 1660 Ti 6GB)
+- **RAM**: 16GB+ system
+- **SSD**: 20GB+ free for experts + checkpoints
+- **Disk**: 10GB+ free on C: for uv cache
+
+---
 
 ## Architecture Decisions
 
-See `notes/DECISIONS.md` for detailed rationale on all major choices.
+See `ARCHITECTURE.md` for deep technical documentation.
+See `docs/sync_protocol.md` for psudo-engine ↔ psudo-harness sync protocol.
 
 ---
 

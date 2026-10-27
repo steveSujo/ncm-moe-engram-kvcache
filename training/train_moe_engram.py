@@ -14,6 +14,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import GradScaler, autocast
 from omegaconf import OmegaConf
@@ -25,9 +26,6 @@ import pickle
 from models.moe_engram_generator import MoEEngramNextConceptTransformer, create_moe_engram_model
 from models.common import NextConceptTransformer
 from tokenization.vqvae_tokenizer import VQVAETokenizer
-
-
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-8s | %(message)s',
@@ -40,30 +38,57 @@ logger = logging.getLogger(__name__)
 
 
 class TinyStoriesDataset(Dataset):
-    """Pre-tokenized TinyStories dataset."""
+    """Pre-tokenized TinyStories dataset from hazyresearch/ncm-datasets format."""
     
-    def __init__(self, data_path: str, context_length: int = 128):
+    def __init__(self, data_dir: str, context_length: int = 128):
         self.context_length = context_length
+        self.data_dir = data_dir
         
-        if data_path.endswith('.pkl'):
-            with open(data_path, 'rb') as f:
-                self.data = pickle.load(f)
+        # Load the hazyresearch/ncm-datasets format
+        # train_bpe_8192.bin + train_bpe_8192_offsets.npy + train_bpe_8192.pickle
+        bin_path = os.path.join(data_dir, 'train_bpe_8192.bin')
+        offsets_path = os.path.join(data_dir, 'train_bpe_8192_offsets.npy')
+        pickle_path = os.path.join(data_dir, 'train_bpe_8192.pickle')
+        
+        # Memory-map the binary data
+        self.tokens = np.memmap(bin_path, dtype=np.uint16, mode='r')
+        self.offsets = np.load(offsets_path)
+        
+        # Also load validation data
+        val_bin_path = os.path.join(data_dir, 'valid_bpe_8192.bin')
+        val_pickle_path = os.path.join(data_dir, 'valid_bpe_8192.pickle')
+        if os.path.exists(val_bin_path):
+            self.val_tokens = np.memmap(val_bin_path, dtype=np.uint16, mode='r')
+            self.val_data = pickle.load(open(val_pickle_path, 'rb'))
         else:
-            # Raw text -> tokenize on the fly
-            raise NotImplementedError("Only pre-tokenized .pkl supported")
+            self.val_tokens = None
+            self.val_data = None
         
-        # Flatten into chunks of context_length
+        # Build chunks from training data
         self.chunks = []
-        for seq in self.data:
-            # Ensure we have enough tokens
+        self._build_chunks()
+        
+        logger.info(f"Dataset: {len(self.chunks)} chunks of length {context_length}")
+    
+    def _build_chunks(self):
+        """Build context-length chunks from the token sequences using offsets."""
+        context_length = self.context_length
+        
+        # Iterate through each story using offsets
+        for i in range(len(self.offsets) - 1):
+            start = self.offsets[i]
+            end = self.offsets[i + 1]
+            seq = self.tokens[start:end].tolist()
+            
             if len(seq) >= context_length:
-                for i in range(0, len(seq) - context_length + 1, context_length // 2):
-                    self.chunks.append(seq[i:i + context_length])
+                # Chunk into overlapping windows
+                for j in range(0, len(seq) - context_length + 1, context_length // 2):
+                    self.chunks.append(seq[j:j + context_length])
             else:
-                # Pad if needed
+                # Pad short sequences
                 padded = seq + [0] * (context_length - len(seq))
                 self.chunks.append(padded[:context_length])
-        logger.info(f"Dataset: {len(self.chunks)} chunks of length {context_length}")
+    
     def __len__(self):
         return len(self.chunks)
     
@@ -72,29 +97,23 @@ class TinyStoriesDataset(Dataset):
 
 
 def prepare_dataset():
-    """Download and prepare TinyStories dataset."""
-    from huggingface_hub import snapshot_download
+    """Verify dataset exists (download handled externally)."""
+    data_dir = "data/tinystories/tinystories"
     
-    # Download NCM datasets
-    os.makedirs("data/tinystories", exist_ok=True)
-    snapshot_download(
-        repo_id="hazyresearch/ncm-datasets",
-        local_dir="data/tinystories",
-        local_dir_use_symlinks=False,
-        allow_patterns=["tinystories/*"]
-    )
+    # Check for the hazyresearch/ncm-datasets format files
+    bin_path = os.path.join("data/tinystories/tinystories", 'train_bpe_8192.bin')
+    offsets_path = os.path.join("data/tinystories/tinystories", 'train_bpe_8192_offsets.npy')
+    pickle_path = os.path.join("data/tinystories/tinystories", 'train_bpe_8192.pickle')
     
-    # The dataset should have train.pkl - check both locations
-    path1 = "data/tinystories/tinystories/train.pkl"
-    path2 = "data/tinystories/train.pkl"
-    if os.path.exists(path1):
-        return path1
-    elif os.path.exists(path2):
-        return path2
-    else:
-        raise FileNotFoundError(f"Dataset not found at {path1} or {path2}")
-
-
+    if not os.path.exists(bin_path):
+        raise FileNotFoundError(f"Dataset binary not found at {bin_path}")
+    if not os.path.exists(offsets_path):
+        raise FileNotFoundError(f"Dataset offsets not found at {offsets_path}")
+    if not os.path.exists(pickle_path):
+        raise FileNotFoundError(f"Dataset pickle not found at {pickle_path}")
+    
+    # Return the data directory for the dataset class
+    return "data/tinystories/tinystories"
 def get_optimizer(model, lr_trunk=3e-4, lr_engram=1e-4, lr_expert=3e-3, weight_decay=0.1):
     """
     Two-timescale optimizer.

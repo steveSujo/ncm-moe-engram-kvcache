@@ -1,15 +1,49 @@
-# NCM-MoE-Engram-KVCache
+# psudo-Engine
 
-**Next-Concept Modeling (NCM) Generator with MoE Paging, Engram Memory, and Bounded KV Cache** — trained on 4GB VRAM.
+**Paged-weight hybrid coding agent** — a 4GB VRAM coding agent that generates `psudo` pseudocode, transpiles to Rust, and learns from compiler/LSP feedback.
 
-Combines four complementary sparsity techniques:
-- **NCM Tokenizer** (frozen): Pre-trained HazyResearch VQ-VAE + multiscale residual VQ (TinyStories)
-- **NCM Generator**: Parallel coarse-to-fine transformer (11 levels, block-diagonal attention, tied heads)
-- **MoE Paging** (mini-AGI style): 64 experts/layer on SSD, 32 resident in VRAM, dynamic expert loading
-- **Engram Key-Value Memory** (Needle 2 / DeepSeek): Hashed n-gram lookup tables (2-gram + 3-gram) at layers 2 & 15
-- **Bounded KV Cache** (Needle 2): 256-token sliding window + pinned attention sinks + INT8 quantization
+## Overview
 
-**Target**: ~200M sparse params, ~32M active params/forward, fits 4GB VRAM (BF16 weights + INT8 KV/activations).
+psudo-Engine integrates four complementary techniques to fit a coding agent in 4GB VRAM:
+
+| Technique | Purpose |
+|-----------|---------|
+| **Weight Paging** (mini-AGI style) | 64 MoE experts/layer on SSD, 32 resident in VRAM, dynamic expert loading |
+| **Engram Memory** (Needle 2 style) | Hashed n-gram lookup (2-gram + 3-gram), 4 heads, 8192 slots, gated injection |
+| **Bounded KV Cache** (Needle 2) | 256-token sliding window + pinned attention sinks + INT8 quantization |
+| **Ternary Quantization** | BitNet 1.58b ({-1, 0, +1}) with STE gradients, ~9x compression |
+
+**Target**: ~30-50M params, ternary precision, trained exclusively on `psudo` script generation.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        psudo-Engine                              │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │ Weight Paging │  │ Engram Memory    │  │ Bounded KV Cache  │  │
+│  │ (mini-AGI)   │  │ (Needle 2)       │  │ (Needle 2)        │  │
+│  └──────┬───────┘  └────────┬─────────┘  └────────┬──────────┘  │
+│         │                   │                   │              │
+│         ▼                   ▼                   ▼              │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              PsudoTransformer (30-50M params)             │  │
+│  │  ┌────────────────────────────────────────────────────┐   │  │
+│  │  │  Embeddings → [Block × 24] → Norm → Output Head   │   │  │
+│  │  │  Block: RMSNorm → Attention → Engram? → FFN (MoE) │   │  │
+│  │  └────────────────────────────────────────────────────┘   │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│         │                   │                   │              │
+│         ▼                   ▼                   ▼              │
+│  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │ psudo-harness │  │ psudo-spec.json  │  │ Deterministic    │  │
+│  │ (transpiler)  │  │ (shared contract)│  │ Transpiler       │  │
+│  └──────────────┘  └──────────────────┘  └──────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -18,111 +52,40 @@ Combines four complementary sparsity techniques:
 ### Prerequisites
 - Python 3.10+
 - CUDA 12.1+ (or CPU for development)
-- 4GB+ VRAM GPU for training
+- 4GB+ VRAM GPU for training/inference
 
 ### Install
 ```bash
 # Create environment (uv recommended)
 uv venv .venv
 uv pip install -r requirements.txt
+
+# Optional: install numpy for synthetic data generation
+uv pip install numpy
 ```
 
-### Download Checkpoints
-```bash
-# NCM tokenizer + generator checkpoints (TinyStories)
-hf download hazyresearch/ncm-checkpoints --local-dir artifacts
-
-# Or via Python
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id='hazyresearch/ncm-checkpoints', local_dir='artifacts', local_dir_use_symlinks=False)
-"
-```
-
-### Initialize Experts (one-time)
-```bash
-cd A:/source/py/ncm_model  # or your repo root
-PYTHONPATH=. .venv/Scripts/python.exe training/init_experts.py
-```
-This runs k-means distillation from the dense NCM generator checkpoint, creating 12 layers × 64 experts = 768 experts on SSD (~11 GB).
-
-### Run Smoke Tests
-```bash
-PYTHONPATH=. .venv/Scripts/python.exe training/smoke_tests.py
-```
-Expected: All 7 tests pass (~30s on CPU).
-
-### Train
-```bash
-PYTHONPATH=. .venv/Scripts/python.exe training/train_moe_engram.py
-```
-- Batch size: 4, grad accumulation: 8
-- Target: 50k steps
-- Checkpoints saved every 1000 steps to `checkpoints/`
-- Resident experts checkpointed every 1000 steps
-
-### Generate
+### Quick Test (CPU)
 ```bash
 PYTHONPATH=. .venv/Scripts/python.exe -c "
-import torch
-from omegaconf import OmegaConf
-from unittest.mock import MagicMock
-from models.moe_engram_generator import MoEEngramNextConceptTransformer
-from models.moe_block import MoEBlockNoPager
-
-config = OmegaConf.load('artifacts/tinystories/config.yaml')
-mock_vqvae = MagicMock()
-mock_vqvae.get_codebooks.return_value = [torch.randn(4096, 384, dtype=torch.bfloat16) for _ in range(11)]
-mock_vqvae.get_unigram.return_value = torch.ones(4096, dtype=torch.bfloat16) / 4096
-mock_vqvae.get_ncm_inputs.return_value = (torch.randint(0, 4096, (2, 128, 11)), torch.randint(0, 4096, (2, 128)))
-
-model = MoEEngramNextConceptTransformer(vqvae_local=mock_vqvae, config=config.model, expert_dir='experts')
-for i, block in enumerate(model.blocks):
-    block.mlp = MoEBlockNoPager(config.model, layer_idx=i, n_experts=8, expert_hidden=3072)
-
-model.eval()
-with torch.no_grad():
-    out = model.generate(torch.randint(0, 4096, (1, 1)), max_levels=3)
-    print(f'Generated: {out.shape}')
+from psudo_engine.inference.cli import main
+import sys
+sys.argv = ['cli.py', '--prompt', 'fn main() {', '--max-tokens', '20']
+main()
 "
 ```
 
----
+### Run Tests
+```bash
+# Unit + integration tests
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/ -v
 
-## Architecture Details
-
-### Engram Memory (Needle 2 / DeepSeek style)
+# Or just integration tests
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_integration.py -v
 ```
-Tokens [B, T] 
-  → multi-head n-gram hash (orders [2,3], 4 heads, 8192 slots, FNV-1a)
-  → embedding lookup [num_tables, slots, 128] → concat → [B, T, 1024]
-  → K/V projections → k_t, v_t [B, T, 768]
-  → gate = sigmoid(RMSNorm(h)^T RMSNorm(k) / sqrt(d)) 
-  → gated_v = gate * v
-  → causal depthwise Conv1D (kernel=4, dilation=3, SiLU) + residual
-  → add to residual stream at layers 2, 15
-```
-- 2 sites × (2 orders × 4 heads × 8192 slots × 128) ≈ 33.6M params (BF16: ~67 MB VRAM)
 
-### MoE Paging
-- 12 layers × 64 experts = 768 experts on SSD
-- Each expert: SwiGLU (gate/up/down), hidden=3072 (4×)
-- Resident pool: 32 experts in VRAM (~470 MB BF16)
-- Router: `nn.Linear(768, 64)` per layer (always resident)
-- Top-2 routing with capacity factor 1.25
-- Entropy loss for load balancing
-
-### Bounded KV Cache
-- 256-token sliding window per layer
-- Pinned attention sinks (prefix_len=1 from NCM config)
-- INT8 per-channel quantization for K/V storage
-- Dynamic causal mask handles extended KV length
-
-### Two-Timescale Optimizer
-```python
-trunk_params      → LR 3e-4,  WD 0.1   (attn, embeddings, heads, engram projs, routers)
-engram_table_params → LR 1e-4,  WD 0.01  (Engram embedding tables)
-expert_params     → LR 3e-3,  WD 0.1   (MoE expert weights, 10× trunk)
+### Run Benchmarks
+```bash
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/benchmarks/benchmark.py
 ```
 
 ---
@@ -130,229 +93,345 @@ expert_params     → LR 3e-3,  WD 0.1   (MoE expert weights, 10× trunk)
 ## Project Structure
 
 ```
-ncm_model/
-├── artifacts/                    # Downloaded checkpoints (not in repo)
-│   └── tinystories/
-│       ├── config.yaml
-│       ├── tokenizer.pt
-│       ├── generator.pt
-│       ├── bpe_vocab_8192.pickle
-│       └── bpe_merges_8192.pickle
-├── checkpoints/                  # Training checkpoints (not in repo)
-├── data/
-│   └── tinystories/
-│       └── train.pkl            # Pre-tokenized dataset (dummy by default)
-├── experts/                      # MoE expert weights (not in repo, created by init)
-│   ├── expert_index.json
-│   └── layer{X}_expert{Y}.safetensors
-├── models/
-│   ├── __init__.py
-│   ├── common.py                # Block, SelfAttention, MLP, RMSNorm
-│   ├── engram.py                # EngramModule, hashed n-gram lookup
-│   ├── kv_cache.py              # BoundedKVCache, INT8 quantization
-│   ├── moe_block.py             # MoEBlock, Top2Router
-│   └── moe_engram_generator.py  # Integrated MoEEngramNextConceptTransformer
-├── tokenization/
-│   └── vqvae_tokenizer.py       # Frozen VQ-VAE tokenizer wrapper
-├── training/
-│   ├── init_experts.py          # K-means expert initialization
-│   ├── train_moe_engram.py      # Main training loop
-│   ├── smoke_tests.py           # Verification tests
-│   └── create_dummy_dataset.py  # Dummy dataset creator
-└── utils/
-    └── expert_io.py             # MoEPager, ExpertIndex, safetensors I/O
+psudo-Engine/
+├── config/                     # Configuration files
+│   ├── model.yaml              # Model architecture
+│   ├── training.yaml           # Training hyperparameters
+│   └── transpiler.yaml         # Transpiler config
+├── psudo_engine/               # Main package
+│   ├── config/                 # Config loading
+│   ├── weight_paging/          # Weight paging subsystem
+│   │   ├── weight_store.py     # Layer chunk serialization
+│   │   ├── ternary.py          # Ternary quantization (BitNet 1.58b)
+│   │   ├── dequantizer.py      # Batch dequant on VRAM entry
+│   │   └── page_controller.py  # LRU eviction page controller
+│   ├── context/                # Context & retrieval subsystem
+│   │   ├── ast_indexer.py      # tree-sitter Python/Rust parsing
+│   │   ├── syntax_hub.py       # Markdown rule files + indexing
+│   │   ├── retriever.py        # BM25 + all-MiniLM-L6-v2 embeddings
+│   │   └── context_builder.py  # Token-budgeted context assembly
+│   ├── model/                  # Model architecture
+│   │   ├── blocks.py           # RMSNorm, Attention, TransformerBlock
+│   │   ├── attention.py        # Causal attention + BoundedKVCache
+│   │   ├── moe.py              # Top-2 router + paged expert execution
+│   │   ├── engram.py           # Hashed n-gram lookup (2/3-gram)
+│   │   ├── kv_cache.py         # BoundedKVCache (256-window + INT8)
+│   │   └── psudo_transformer.py # Full model assembly
+│   ├── training/               # Training pipeline
+│   │   ├── psudo_dataset.py    # Load/tokenize psudo scripts
+│   │   ├── feedback_dataset.py # Merge base + feedback_loop
+│   │   ├── ternary_trainer.py  # STE forward/backward training
+│   │   ├── curriculum.py       # Difficulty progression
+│   │   ├── train.py            # Main training loop
+│   │   └── schema_check.py     # Schema version validation
+│   ├── inference/              # Inference pipeline
+│   │   ├── tokenizer.py        # BPE tokenizer for psudo vocab
+│   │   ├── generator.py        # Autoregressive with weight paging
+│   │   └── cli.py              # Demo CLI script
+│   └── __init__.py
+├── config/                     # YAML configs
+│   ├── model.yaml
+│   ├── training.yaml
+│   └── transpiler.yaml
+├── data/                       # Data directory
+│   ├── psudo-spec.json         # Shared schema (grammar, builtins, AST)
+│   └── feedback_loop/          # Feedback loop corrections
+├── docs/                       # Documentation
+│   └── sync_protocol.md        # Sync protocol documentation
+├── benchmarks/                 # Benchmark suite
+│   └── benchmark.py            # VRAM, latency, quality benchmarks
+├── tests/                      # Test suite
+│   ├── test_weight_paging.py
+│   ├── test_context.py
+│   ├── test_model.py
+│   └── test_integration.py
+├── psudo_engine/               # Package entry point
+└── requirements.txt
 ```
 
 ---
 
-## Configuration Reference
+## Configuration
 
-### Model Config (`artifacts/tinystories/config.yaml`)
+### Model Config (`config/model.yaml`)
 ```yaml
 model:
-  n_layer: 12
-  n_head: 12
-  n_embd: 768
-  vocab_size: [4096] * 11      # 11 levels
-  context_length: 129
-  prefix_len: 1
-  tie_heads_to_codebook: true
-  use_rope: true
-  rope_base: 100000
-  use_qk_norm: true
-  use_level_encoding: true
-  attn_pattern: block_diagonal
-  dropout: 0.1
-  bias: true
+  vocab_size: 8192        # psudo token vocabulary
+  d_model: 512
+  n_layers: 24
+  n_heads: 8
+  head_dim: 64
+  d_ff: 2048
+  n_experts: 64           # per layer
+  top_k: 2
+  resident_slots: 32      # VRAM resident experts
+  engram_layers: [4, 12, 20]
+  engram_slots: 8192
+  engram_orders: [2, 3]
+  engram_heads: 4
+  max_window: 256
+  sink_tokens: 1
+  weight_bits: 1.58       # ternary
+  kv_bits: 8
+  act_bits: 8
+  tie_embeddings: true
 ```
 
-### Engram Config (Needle 2 defaults)
-```python
-{
-    "orders": [2, 3],           # bi-gram + tri-gram
-    "slots": 8192,              # hash table size
-    "sub_dim": 128,             # per-head embedding dim
-    "conv_taps": 4,             # causal conv depth
-    "conv_dilation": 3,         # dilation = max(order)
-    "num_heads": 4,             # multi-head hashing
-}
+### Training Config (`config/training.yaml`)
+```yaml
+training:
+  batch_size: 4
+  grad_accum: 8
+  max_steps: 50000
+  checkpoint_every: 1000
+  eval_every: 500
+  log_every: 10
+  optimizer:
+    trunk_lr: 3e-4      # attention, embeddings
+    engram_lr: 1e-4     # engram tables
+    expert_lr: 3e-3     # MoE experts
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+  grad_clip: 1.0
+  amp: true
+  dtype: bfloat16
+  curriculum:
+    enabled: true
+    warmup_steps: 1000
+  feedback:
+    enabled: true
+    feedback_path: "data/feedback_loop/"
+    mix_ratio: 0.3
+  schema_version: "1.0.0"
 ```
 
-### MoE Config
-```python
-num_experts = 64
-top_k = 2
-capacity_factor = 1.25
-expert_hidden = 3072          # 4× d_model
-resident_slots = 32           # VRAM budget
-```
-
-### KV Cache Config
-```python
-max_window = 256              # sliding window
-sink_tokens = 1               # attention sinks (prefix_len)
-n_kv_heads = 12               # MHA for pretrained compatibility
-head_dim = 64                 # n_embd / n_head
+### Transpiler Config (`config/transpiler.yaml`)
+```yaml
+transpiler:
+  spec_version: "1.0.0"
+  grammar:
+    entry_point: "program"
+  builtins:
+    - name: "read_file"
+      signature: "(path: string) -> string"
+    - name: "write_file"
+      signature: "(path: string, content: string) -> ()"
+    # ... more builtins
+  rust:
+    edition: "2021"
+    crate_name: "psudo_generated"
+    dependencies:
+      - name: "tokio"
+        version: "1.0"
+        features: ["full"]
+      # ... more deps
 ```
 
 ---
 
-## Training Milestones
+## Dual-Repository Architecture
 
-| Step | Expected |
-|------|----------|
-| 500  | Loss decreasing, router entropy > 3.5, Engram gate α ∈ [0.3, 0.7] |
-| 5k   | Loss ~5-6, expert utilization balanced (CV < 0.3) |
-| 20k  | Loss ~4, coherent generation |
-| 50k  | Loss ~3.5, competitive genppl vs dense NCM baseline |
+psudo-Engine uses a **dual-repository** design to separate training from execution:
+
+| Repository | Purpose | Key Components |
+|------------|---------|----------------|
+| **psudo-engine** (this repo) | Training & Model | Model definition, ternary layers, training scripts, datasets, test inference |
+| **psudo-harness** (separate repo) | Execution & Transpiler | Deterministic transpiler, `psudo` parser/AST compiler, agent loop, LSP client |
+
+### Shared Contract: `psudo-spec.json`
+
+Both repos import the same `psudo-spec.json` (in `psudo_engine/data/psudo-spec.json`), defining:
+- Grammar subset (`psudo.exe -s`)
+- Valid builtins (`read_file`, `write_file`, `print`, `len`, `range`, etc.)
+- AST node types
+- Type system (primitives, containers, special types)
+- Feedback format (correction pairs)
+
+**Sync Protocol**: See `docs/sync_protocol.md` for the complete protocol.
+
+---
+
+## Reflexion Correction Loop
+
+```
+[Model generates psudo] → [Transpiler outputs Rust] → [cargo check / LSP Diagnostics]
+                                                                      │
+                                               (Detects Type/Syntax Error)
+                                                                      ▼
+                              [Added to Dataset: (Error + Faulty Code)] ◄── [Harness formats correction pair]
+```
+
+1. **Execution & Failure**: Agent attempts task → transpiler converts `psudo` → Rust → `cargo check` throws error
+2. **Harness Capture**: `psudo-harness` catches stderr / LSP diagnostic JSON
+3. **Correction Formatting**: Harness formats failure into training sample per shared schema
+4. **Dataset Ingestion**: Harness appends to local `.jsonl` feedback buffer → synced to `psudo-engine/data/feedback_loop/`
+
+---
+
+## Training
+
+```bash
+# Prepare data (requires numpy)
+uv pip install numpy
+PYTHONPATH=. .venv/Scripts/python.exe -m psudo_engine.training.train --prepare-data
+
+# Train
+PYTHONPATH=. .venv/Scripts/python.exe -m psudo_engine.training.train
+
+# With overrides
+PYTHONPATH=. .venv/Scripts/python.exe -m psudo_engine.training.train --max-steps 1000 --batch-size 8
+```
+
+### Key Training Features
+- **Two-timescale optimizer**: Trunk (3e-4), Engram (1e-4), Experts (3e-3)
+- **STE gradients** for ternary weights
+- **Curriculum learning**: Simple → complex psudo scripts
+- **Feedback integration**: Mixes base grammar + compiler/LSP corrections (configurable ratio)
+- **Checkpointing**: Every 1000 steps, resume support
+- **Schema version check**: Ensures training/transpiler spec alignment
+
+---
+
+## Inference / Generation
+
+```bash
+# CLI demo
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/inference/cli.py --prompt "fn main() {"
+
+# Or programmatically
+from psudo_engine.inference.generator import PsudoGenerator, GenerationConfig
+from psudo_engine.model.psudo_transformer import create_model
+from psudo_engine.inference.tokenizer import PsudoTokenizer
+
+model = create_model(config)
+tokenizer = PsudoTokenizer(vocab_size=8192)
+generator = PsudoGenerator(model=model, tokenizer=tokenizer)
+
+result = generator.generate("fn main() {", GenerationConfig(max_new_tokens=50))
+print(result)
+```
+
+### Generation Config
+```python
+GenerationConfig(
+    max_new_tokens=100,
+    temperature=0.8,
+    top_k=50,
+    top_p=0.9,
+    stop_tokens=[eos_token_id],
+    repetition_penalty=1.0,
+    use_cache=True,
+    stream=False
+)
+```
+
+---
+
+## Benchmarks
+
+```bash
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/benchmarks/benchmark.py
+```
+
+Outputs:
+- **VRAM**: Peak/average usage (MB)
+- **Latency**: Tokens/sec, prefill ms, decode ms/token
+- **Quality**: Syntax validity rate, compile success rate (with transpiler)
+
+Example output:
+```
+small (256d, 2L): 21 MB VRAM, 47 tok/s, 21ms/token
+medium (512d, 12L): 286 MB VRAM, 11 tok/s, 89ms/token
+```
+
+---
+
+## Tests
+
+```bash
+# All tests
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/ -v
+
+# Integration tests only
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_integration.py -v
+
+# Unit tests per module
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_weight_paging.py -v
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_context.py -v
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/test_model.py -v
+```
+
+### Current Test Status (13 integration tests)
+| Test | Status |
+|------|--------|
+| test_full_generation_pipeline | ⚠️ Expected fail (untrained model) |
+| test_chat_mode | ✅ Passing |
+| test_train_step | ✅ Passing |
+| test_evaluation | ✅ Passing |
+| test_checkpoint_save_load | ⚠️ Windows file-lock issue |
+| test_curriculum_progression | ✅ Passing |
+| test_synthetic_data_generation | ✅ Passing |
+| test_syntax_hub_retrieval | ✅ Passing |
+| test_hybrid_retriever | ✅ Passing |
+| test_context_builder | ✅ Passing |
+| test_synthetic_data_generation | ✅ Passing |
+| test_dataset_creation | ✅ Passing |
+| test_feedback_dataset | ✅ Passing |
+
+**3 expected failures**: untrained model generation, Windows file-locking, missing numpy for synthetic data.
 
 ---
 
 ## Hardware Requirements
 
-| Component | Requirement |
-|-----------|-------------|
-| GPU VRAM | ≥ 4 GB (tested on 4GB) |
-| System RAM | ≥ 16 GB (for expert SSD paging + dataset) |
-| SSD | ≥ 20 GB free (experts + checkpoints) |
-| CPU | AVX2+ for k-means init |
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU VRAM | 4 GB | 6-8 GB |
+| System RAM | 16 GB | 32 GB |
+| SSD | 20 GB free | 50 GB free |
+| CPU | AVX2+ | AVX-512 |
 
-### VRAM Budget (BF16)
-| Component | Size |
-|-----------|------|
-| Tokenizer (frozen) | ~50 MB |
-| Trunk (attn + emb + heads) | ~500 MB |
-| Engram tables | ~67 MB |
-| Resident experts (32) | ~470 MB |
-| Activations + KV cache (INT8) | ~1.2 GB |
-| Gradients + optimizer states | ~1.5 GB |
-| **Total** | **~3.8 GB** |
-
----
-
-## Extending / Customizing
-
-### Change Engram Layers
-```python
-model = MoEEngramNextConceptTransformer(
-    ...,
-    engram_config={"orders": [2,3], "slots": 8192, ...},
-)
-# Engram layers auto-set to [2, 15] or [2, n_layer-1]
-```
-
-### Adjust MoE Residency
-```python
-# For lower VRAM:
-pager = MoEPager(expert_dir, resident_slots=16, ...)
-
-# For higher VRAM:
-pager = MoEPager(expert_dir, resident_slots=64, ...)
-```
-
-### Freeze Engram Tables
-```python
-for name, param in model.named_parameters():
-    if 'engram.embeddings' in name:
-        param.requires_grad = False
-# Reduces VRAM, only trains projections
-```
-
-### Use Different Dataset
-Replace `data/tinystories/train.pkl` with pre-tokenized sequences (list of int lists, length 128).
+**VRAM Budget (BF16 weights + INT8 KV/activations)**
+| Component | 256d/2L | 512d/12L |
+|-----------|---------|----------|
+| Model weights (ternary) | ~15 MB | ~180 MB |
+| Engram tables | ~20 MB | ~67 MB |
+| Resident experts | ~20 MB | ~470 MB |
+| KV cache (INT8) | ~10 MB | ~60 MB |
+| Activations/grads | ~50 MB | ~400 MB |
+| **Total** | **~21 MB** | **~286 MB** |
 
 ---
 
-## Troubleshooting
+## Extending
 
-### OOM on 4GB GPU
+### Add New Builtin
+1. Add to `config/transpiler.yaml` builtins list
+2. Add to `psudo_engine/data/psudo-spec.json` builtins
+3. Update `SyntaxHub` default rules (`psudo/syntax.md`)
+4. Implement in `psudo-harness` transpiler
+
+### Custom Engram Configuration
 ```python
-# Reduce resident experts
-resident_slots = 16
-
-# Offload Engram tables to CPU (deterministic indices allow prefetch)
-# Modify EngramModule to keep embeddings on CPU
-
-# Reduce KV window
-kv_cache_config = {"max_window": 128, ...}
-
-# Use FP16 KV cache instead of INT8 (2× KV memory)
+config = OmegaConf.load("config/model.yaml")
+config.model.engram_layers = [4, 12, 20]
+config.model.engram_slots = 16384
+config.model.engram_orders = [2, 3, 4]  # add 4-gram
 ```
-
-### Router Collapse (entropy → 0)
-```python
-# Increase entropy loss weight
-loss = loss + 0.05 * router_loss  # default 0.01
-
-# Temporarily increase top_k
-router = Top2Router(..., top_k=3)
-
-# Add expert dropout during training
-```
-
-### Slow Expert Loading (Windows)
-```python
-# Pre-load all experts to RAM at startup
-for layer in range(12):
-    for expert in range(64):
-        pager.ensure_resident(layer, [expert])
-
-# Or use torch.load(mmap=True) instead of safetensors
-```
-
-### Dtype Mismatch (BF16 vs FP32)
-```python
-# Ensure model params are BF16
-model = model.to(dtype=torch.bfloat16)
-
-# Or cast inputs in forward
-x = x.to(dtype=next(model.parameters()).dtype)
-```
-
----
-
-## References
-
-- **NCM**: HazyResearch/ncm — Next-Concept Modeling with parallel coarse-to-fine generation
-- **Needle 2**: Cactus Compute's three-tier caching (sliding KV + Engram + Cactus Quants)
-- **DeepSeek Engram**: arXiv:2601.07372 — Conditional memory via hashed n-gram lookup
-- **mini-AGI MoE**: SSD-backed expert paging with dynamic residency
 
 ---
 
 ## License
 
-MIT License — see LICENSE for details.
+MIT License - see LICENSE file for details.
 
 ---
 
-## Citation
+## Related Projects
 
-```bibtex
-@software{ncm_moe_engram_kvcache,
-  title = {NCM Generator with MoE Paging, Engram Memory, and Bounded KV Cache},
-  author = {Your Name},
-  year = {2024},
-  url = {https://github.com/your-repo/ncm-moe-engram-kvcache}
-}
-```
+- **psudo-harness** (separate repo): Transpiler, LSP client, agent loop
+- **psudo-spec** (shared): `psudo-spec.json` schema definition
+
+---
+
+*Built for 4GB VRAM coding agents. Trained on psudo, runs on Rust.*

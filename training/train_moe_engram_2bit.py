@@ -8,29 +8,23 @@ Native 2-bit training using Cactus Quants (CQ) from Needle:
 - Gradient accumulation (accum=16 for effective batch 64)
 - Gradient checkpointing on all blocks
 """
-
+import argparse
+import logging
+import math
 import os
+import pickle
+
 # Memory optimization environment variables
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from omegaconf import OmegaConf
 from torch.amp import GradScaler, autocast
 from torch.utils.checkpoint import checkpoint
-from omegaconf import OmegaConf
-import logging
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-import math
-import pickle
-import argparse
 
-from models.moe_engram_generator_2bit import MoEEngramNextConceptTransformer2Bit, create_moe_engram_model_2bit
-from models.block_2bit import Block2Bit
-from tokenization.vqvae_tokenizer import VQVAETokenizer
-from utils.expert_io_2bit import CQQuantizedMoEPager
-
+from models.moe_engram_generator_2bit import create_moe_engram_model_2bit
 
 # Setup logging
 logging.basicConfig(

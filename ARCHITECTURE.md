@@ -1,6 +1,6 @@
-# Architecture Documentation
+# psudo-Engine Architecture Documentation
 
-Deep technical documentation for the NCM-MoE-Engram-KVCache model.
+Deep technical documentation for the psudo-Engine paged-weight hybrid coding agent.
 
 ## Table of Contents
 1. [Overall Architecture](#overall-architecture)
@@ -9,6 +9,7 @@ Deep technical documentation for the NCM-MoE-Engram-KVCache model.
 4. [Memory Management](#memory-management)
 5. [Training Pipeline](#training-pipeline)
 6. [Generation Pipeline](#generation-pipeline)
+6. [Dual-Repository Sync Protocol](#dual-repository-sync-protocol)
 
 ---
 
@@ -16,320 +17,176 @@ Deep technical documentation for the NCM-MoE-Engram-KVCache model.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        NCM-MoE-Engram-KVCache Model                         │
+│                           psudo-Engine                                       │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
-│  │   Input      │    │  Embeddings  │    │  Transformer │                  │
-│  │  Tokens      │───▶│  (wte, wle,  │───▶│  Blocks      │                  │
-│  │  [B, T]      │    │   wpe)       │    │  ×12         │                  │
-│  └──────────────┘    └──────────────┘    └──────┬───────┘                  │
-│                                                  │                          │
-│                    ┌─────────────────────────────┼─────────────────────┐   │
-│                    ▼                             ▼                     ▼   │
-│             ┌─────────────┐              ┌─────────────┐         ┌─────────┐│
-│             │   Engram    │              │   MoE FFN   │         │  Self   ││
-│             │  (layers    │              │  (all       │         │ Attention││
-│             │   2, 15)    │              │   layers)   │         │  + KV   ││
-│             └──────┬──────┘              └──────┬──────┘         │  Cache  ││
-│                    │                            │                └────┬────┘│
-│                    └────────────────────────────┘                     │      │
-│                                         │                             │      │
-│                                         ▼                             │      │
-│                              ┌─────────────────────┐                 │      │
-│                              │    Layer Norm       │                 │      │
-│                              │    + LM Heads       │                 │      │
-│                              │    (per level)      │                 │      │
-│                              └──────────┬──────────┘                 │      │
-│                                         │                             │      │
-│                    ┌────────────────────┴────────────────────┐       │      │
-│                    ▼                                         ▼       ▼      │
-│           ┌───────────────┐                          ┌───────────────┐      │
-│           │  Next Token   │                          │  Engram KV    │      │
-│           │  Logits       │                          │  (for next    │      │
-│           │  [B, T, V]    │                          │  layer)       │      │
-│           └───────────────┘                          └───────────────┘      │
-│                                                                             │
+│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────────┐      │
+│  │  Weight      │    │   Engram         │    │   Bounded KV       │      │
+│  │  Paging      │    │   Memory         │    │   Cache            │      │
+│  │  (mini-AGI)  │    │   (Needle 2)     │    │   (Needle 2)       │      │
+│  └──────┬───────┘    └────────┬─────────┘    └────────┬────────────┘      │
+│         │                     │                    │                    │
+│         ▼                     ▼                    ▼                    │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                    PsudoTransformer (30-50M params)              │  │
+│  │                                                                   │  │
+│  │  ┌────────────────────────────────────────────────────────────┐  │  │
+│  │  │  Embeddings → [Block × 24] → Norm → Output Head            │  │  │
+│  │  │  Block: RMSNorm → Attention → Engram? → FFN (MoE)          │  │  │
+│  │  └────────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│         │                     │                     │                │
+│         ▼                     ▼                     ▼                │
+│  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────────┐    │
+│  │ psudo-harness │  │ psudo-spec.json  │  │ Deterministic      │    │
+│  │ (transpiler)  │  │ (shared contract)│  │ Transpiler        │    │
+│  └──────────────┘    └──────────────────┘    └──────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Key Specifications:**
+- **Model Size**: ~30-50M parameters (ternary)
+- **Precision**: Ternary weights ({-1, 0, +1}) with STE gradients
+- **Target Hardware**: 4GB VRAM (GTX 1660 Ti), 16GB RAM, NVMe SSD
+- **Task**: Causal psudo script generation
 
 ---
 
 ## Component Details
 
-### 1. NCM Tokenizer (Frozen)
+### 1. Weight Paging Subsystem (mini-AGI Style)
 
-**File**: `tokenization/vqvae_tokenizer.py` → wraps `models/vqvae.py`
+**Files**: `psudo_engine/weight_paging/`
 
-**Architecture**:
-- BPE tokenizer (8192 vocab) → VQ-VAE encoder (6 layers, 384 dim)
-- Multiscale residual VQ with 11 codebooks (4096 entries each, 384 dim)
-- Levels: [1, 8, 16, 24, 32, 40, 52, 64, 76, 92, 108, 128] (manual levels)
-- EMA codebook updates, commitment cost 0.25
+| File | Purpose |
+|------|---------|
+| `weight_store.py` | Layer chunk serialization (.bin per layer), metadata index |
+| `ternary.py` | BitNet 1.58b ternary quantization ({-1, 0, +1}) with STE |
+| `dequantizer.py` | Batch dequantization to INT8/BF16 on VRAM entry |
+| `page_controller.py` | LRU eviction, sequential prefetch |
 
-**Interface**:
-```python
-tokenizer = VQVAETokenizer.from_config(config.tokenizer)
-x, targets = tokenizer.vqvae.get_ncm_inputs(batch_tokens)  # x: [B, L, D], targets: [B, 128]
-codebooks = tokenizer.vqvae.get_codebooks()  # List[11] of [4096, 384]
-unigram = tokenizer.vqvae.get_unigram()  # [4096]
-```
+#### Ternary Quantization (BitNet 1.58b)
+- **Values**: {-1, 0, +1} with per-channel scaling factor
+- **Forward**: `w_q = round(w / scale).clamp(-1, 1)`
+- **Backward**: STE - gradients pass through as `grad * scale`
+- **Compression**: ~1.58 bits/param (log₂(3)) ≈ 9x vs BF16
 
-**Frozen**: All params `requires_grad=False`, `eval()` mode.
-
----
-
-### 2. Engram Memory Module
-
-**File**: `models/engram.py`
-
-**Needle 2 / DeepSeek Style Hashed n-gram Lookup**
-
-#### Hash Function (FNV-1a, 32-bit)
-```python
-fnv_prime = 16777619
-offset_basis = 2166136261 + seed * 12345 + head * 67890
-for byte in 4_bytes:
-    h_val ^= byte
-    h_val = (h_val * fnv_prime) & 0xFFFFFFFF
-index = h_val % num_slots
-```
-
-#### Multi-Head n-gram Indices
-- Orders: [2, 3] (bi-gram + tri-gram)
-- 4 heads per order → 8 hash tables total
-- 8192 slots per table
-- 128-dim sub-embeddings per head
-- Total embedding dim: 8 × 128 = 1024
-
-#### Engram Forward
-```python
-# tokens: [B, T]
-indices = engram_indices(tokens, orders=[2,3], num_heads=4, num_slots=8192)  # [B, T, 8]
-
-# Lookup embeddings
-embs = [F.embedding(indices[:,:,i], table_i) for i in range(8)]  # 8 × [B, T, 128]
-concat_emb = torch.cat(embs, dim=-1)  # [B, T, 1024]
-
-# Project to K, V
-k = k_proj(concat_emb)  # [B, T, 768]
-v = v_proj(concat_emb)  # [B, T, 768]
-```
-
-#### Gated Fusion
-```python
-# At layers 2 and 15
-x_norm = rmsnorm_x(x)  # [B, T, 768]
-k_norm = rmsnorm_k(k)  # [B, T, 768]
-gate = sigmoid(sum(x_norm * k_norm, dim=-1, keepdim=True) / sqrt(768))  # [B, T, 1]
-gated_v = gate * v  # [B, T, 768]
-
-# Causal depthwise conv
-conv_in = gated_v.transpose(1, 2)  # [B, 768, T]
-conv_in = pad(conv_in, (pad_left, 0))  # causal padding
-conv_out = silu(depthwise_conv1d(conv_in))  # [B, 768, T]
-out = x + conv_out.transpose(1, 2)  # residual add
-```
-
-**Memory**: 2 sites × 8 tables × 8192 slots × 128 dim = 16.8M params/site × 2 = 33.6M params (BF16: 67 MB)
+#### Page Controller
+- **Resident slots**: 32 experts in VRAM (configurable)
+- **Eviction**: LRU with sequential prefetch
+- **Disk format**: .bin per layer, safetensors-compatible
 
 ---
 
-### 3. Bounded KV Cache
+### 2. Context & Retrieval Subsystem (Needle 2 Style)
 
-**File**: `models/kv_cache.py`
+**Files**: `psudo_engine/context/`
 
-**Needle 2 Style: 256-token sliding window + pinned sinks**
+| File | Purpose |
+|------|---------|
+| `ast_indexer.py` | tree-sitter Python/Rust parsing → function signatures |
+| `syntax_hub.py` | Markdown syntax rules (Python, Rust, psudo builtins) |
+| `retriever.py` | Hybrid BM25 + all-MiniLM-L6-v2 embeddings (RRF) |
+| `context_builder.py` | Token-budgeted (<1500 tokens) context assembly |
 
-#### Structure
+#### Syntax Hub
+- **Sources**: Modular Markdown files (`syntax_rules/{python,rust,psudo,generic}/`)
+- **Categories**: builtin, control_flow, type, pattern, idiom, stdlib
+- **Indexing**: BM25 (keyword) + all-MiniLM-L6-v2 (semantic) → RRF fusion
+
+#### Context Builder
+- **Budget**: <1500 tokens per prompt
+- **Sources**: Task description + relevant syntax rules + AST signatures
+- **Prioritization**: By rule priority + retrieval score
+
+---
+
+### 3. Model Architecture
+
+**Files**: `psudo_engine/model/`
+
+| File | Purpose |
+|------|---------|
+| `blocks.py` | RMSNorm, MultiHeadAttention, SwiGLU, TransformerBlock |
+| `attention.py` | Causal attention with BoundedKVCache |
+| `moe.py` | Top-2 router + paged expert execution |
+| `engram.py` | Hashed n-gram lookup (2-gram + 3-gram) |
+| `kv_cache.py` | BoundedKVCache (256-window + INT8 + sinks) |
+| `psudo_transformer.py` | Full model assembly |
+
+#### PsudoTransformer (30-50M params)
+
+**Config** (`config/model.yaml`):
+```yaml
+model:
+  vocab_size: 8192        # psudo token vocabulary
+  d_model: 512
+  n_layers: 24
+  n_heads: 8
+  head_dim: 64
+  d_ff: 2048
+  n_experts: 64           # per layer
+  top_k: 2
+  resident_slots: 32      # VRAM resident experts
+  engram_layers: [4, 12, 20]
+  engram_slots: 8192
+  engram_orders: [2, 3]
+  engram_heads: 4
+  max_window: 256
+  sink_tokens: 1
+  weight_bits: 1.58       # ternary
+  kv_bits: 8
+  act_bits: 8
 ```
-Layer KV Cache:
-┌─────────────────────────────────────────────────────────────┐
-│  Sink (pinned)     │  Rolling Window (max 256)              │
-│  [B, H, 1, 64]     │  [B, H, W, 64]  where W ≤ 256         │
-│  INT8 + scale      │  INT8 + scale                          │
-└─────────────────────────────────────────────────────────────┘
-Total KV length = 1 + min(seq_len, 256)
+
+#### TransformerBlock
+```
+Input x [B, T, D]
+  → RMSNorm → MultiHeadAttention (with KVCache) → + residual
+  → Engram injection (if layer in engram_layers)
+  → RMSNorm → SwiGLU (MoE) → + residual
+  → Output [B, T, D]
 ```
 
-#### INT8 Quantization
-```python
-# Per-head per-channel
-scale = x.abs().amax(dim=(0, 2)) / 127.0  # [H, D]
-q = (x / scale.unsqueeze(0).unsqueeze(2)).round().clamp(-128, 127).to(torch.int8)
+#### MultiHeadAttention
+- **QKV**: Combined projection → split → RoPE → KVCache.update()
+- **RoPE**: Precomputed cos/sin tables, applied per-head
+- **KVCache**: BoundedKVCache with INT8 quantization, 256-window + 1 sink
 
-# Dequantize
-x = (q.to(float32) * scale.unsqueeze(0).unsqueeze(2)).to(bfloat16)
+#### MoE Layer (Top-2 Router)
+```
+Router: Linear(d_model, n_experts) → Top-2 → softmax
+Experts: SwiGLU (gate/up/down) - loaded on-demand via PageController
+Load balancing: Entropy loss + Z-loss
 ```
 
-#### Update Logic
-```python
-def update(layer_idx, k, v):  # k,v: [B, H, T_new, D]
-    if first_forward:
-        sink_k = k[:, :, :1]      # pin first token
-        sink_v = v[:, :, :1]
-        window_k = k[:, :, 1:]
-        window_v = v[:, :, 1:]
-    else:
-        window_k = cat([window_k, k], dim=2)
-        window_v = cat([window_v, v], dim=2)
-        if window_k.size(2) > 256:
-            window_k = window_k[:, :, -256:]
-            window_v = window_v[:, :, -256:]
-    
-    # Return full KV for attention
-    k_full = cat([dequantize(sink_k), dequantize(window_k)], dim=2)
-    v_full = cat([dequantize(sink_v), dequantize(window_v)], dim=2)
-    return k_full, v_full
+#### Engram Memory (Needle 2 Style)
 ```
-
-#### Causal Mask
-```python
-# Dynamic mask for query_len × (sink + window + query_len)
-kv_len = 1 + window_len + query_len
-mask = tril(ones(query_len, kv_len))  # [1, 1, query_len, kv_len]
+Orders: [2, 3] (bi-gram + tri-gram)
+Heads: 4
+Slots: 8192 per head
+Sub-dim: 128 (512/4)
+Gating: sigmoid(x @ gate_proj) per head×order
+Output: num_heads × num_orders × sub_dim → output_proj → d_model
 ```
 
 ---
 
-### 4. MoE FFN with SSD Paging
+### 4. Bounded KV Cache (Needle 2)
 
-**Files**: `models/moe_block.py`, `utils/expert_io.py`
+**File**: `psudo_engine/model/kv_cache.py`
 
-#### Expert Architecture (SwiGLU)
-```python
-# Expert weights: gate, up, down
-gate = Linear(d_model, expert_hidden, bias=False)  # [3072, 768]
-up   = Linear(d_model, expert_hidden, bias=False)  # [3072, 768]
-down = Linear(expert_hidden, d_model, bias=False)  # [768, 3072]
+| Feature | Spec |
+|---------|------|
+| Window | 256 tokens |
+| Sink tokens | 1 (first token pinned) |
+| Quantization | INT8 per-head per-channel |
+| Dequant | (q.to(fp32) * scale).to(bfloat16) |
 
-# Forward
-gate_out = silu(x @ gate.T)  # [*, 3072]
-up_out   = x @ up.T          # [*, 3072]
-hidden   = gate_out * up_out # [*, 3072]
-out      = hidden @ down.T   # [*, 768]
+**Autoregressive Mask**:
 ```
-
-#### Top-2 Router
-```python
-router = Linear(d_model, 64, bias=False)  # [64, 768]
-
-logits = x @ router.T  # [B*T, 64]
-top_logits, top_indices = topk(logits, k=2, dim=-1)  # [B*T, 2]
-weights = softmax(top_logits, dim=-1)  # [B*T, 2]
-```
-
-#### Entropy Loss
-```python
-probs = softmax(logits, dim=-1)  # [B*T, 64]
-mean_probs = probs.mean(dim=0)   # [64]
-entropy = -sum(mean_probs * log(mean_probs + 1e-8))
-max_entropy = log(64)
-normalized_entropy = entropy / max_entropy  # 0=collapsed, 1=uniform
-loss = 1.0 - normalized_entropy  # encourage high entropy
-```
-
-#### SSD Paging (MoEPager)
-```python
-# Expert storage: 12 layers × 64 experts = 768 files
-# Each expert: 3 tensors (gate, up, down) in BF16
-# Size per expert: 3 × 768 × 3072 × 2 bytes ≈ 14.7 MB
-# Total SSD: ~11.3 GB
-
-# Resident pool: LRU cache of 32 experts in VRAM
-resident = OrderedDict[(layer, expert)] = {gate, up, down tensors}
-
-def ensure_resident(layer_idx, expert_ids):
-    for eid in expert_ids:
-        if (layer_idx, eid) in resident:
-            move_to_end()  # MRU
-        else:
-            if len(resident) >= 32:
-                evict_lru()  # remove from VRAM
-            load_from_ssd()  # safetensors mmap
-            resident[key] = tensors
-    return {eid: resident[(layer_idx, eid)] for eid in expert_ids}
-```
-
-#### MoE Block Forward
-```python
-def forward(x):  # [B, T, 768]
-    x_norm = rmsnorm(x)
-    weights, indices, logits = router(x_norm)  # [B, T, 2], [B, T, 2], [B, T, 64]
-    router_loss = entropy_loss(logits)
-    
-    # Collect unique experts needed
-    unique_experts = indices.unique().tolist()
-    expert_tensors = pager.ensure_resident(layer_idx, unique_experts)
-    
-    # Process per expert
-    out = zeros_like(x_norm)
-    for k in range(2):
-        eid = indices[:, :, k]  # [B, T]
-        w = weights[:, :, k].unsqueeze(-1)  # [B, T, 1]
-        for expert_id in unique_experts:
-            mask = (eid == expert_id)
-            if mask.any():
-                expert_x = x_norm[mask]
-                expert_out = swiglu_forward(expert_x, expert_tensors[expert_id])
-                out[mask] += w[mask] * expert_out
-    
-    return out
-```
-
----
-
-### 5. Integrated Transformer Block
-
-**File**: `models/moe_engram_generator.py`
-
-```python
-class MoEEngramNextConceptTransformer(nn.Module):
-    def __init__(self, vqvae_local, config, expert_dir, ...):
-        # Embeddings
-        self.wte = Embedding(vocab_0, 768)
-        self.wle = Embedding(11, 768)      # level encoding
-        self.wpe = Embedding(129, 768)     # positional
-        
-        # 12 Blocks with MoE FFN
-        self.blocks = ModuleList([Block(config) for _ in range(12)])
-        for i, block in enumerate(blocks):
-            block.mlp = MoEBlock(config, layer_idx=i, pager=pager)
-        
-        # Engram at layers 2, 15
-        self.engram_layers = [2, 15]
-        self.engrams = ModuleList([EngramModule(...) for _ in range(2)])
-        
-        # KV Cache
-        self.kv_cache = MultiLayerKVCache(n_layers=12, max_window=256, ...)
-        
-        # Output heads (tied to codebooks via 384-dim projection)
-        self.proj_to_codebook = Linear(768, 384)
-        self.lm_heads = ModuleList([Linear(384, 4096) for _ in range(11)])
-    
-    def forward(idx, level=0, targets=None, kv_cache=None):
-        # idx: [B, T] token indices for current level
-        
-        # Embeddings
-        x = wte(idx) + wle(level) + wpe(pos)  # [B, T, 768]
-        
-        cache = kv_cache or self.kv_cache
-        
-        for i, block in enumerate(blocks):
-            # Engram injection BEFORE attention at layers 2, 15
-            if i in engram_layers:
-                engram_out = engrams[engram_idx].apply_engam(x, idx)
-                x = engram_out
-            
-            # Block forward with KV cache
-            x = block(x, kv_cache=cache, layer_idx=i)
-        
-        x = ln_f(x)
-        x = proj_to_codebook(x)  # 768 → 384
-        logits = lm_heads[level](x)  # [B, T, 4096]
-        
-        loss = CE(logits, targets) if targets else None
-        return logits, loss
+key_len = cache_len + query_len  (capped at max_window)
+mask = causal_mask(query_len, key_len)  # [1, 1, q_len, key_len]
 ```
 
 ---
@@ -338,89 +195,62 @@ class MoEEngramNextConceptTransformer(nn.Module):
 
 ### Training Forward Pass
 ```
-Batch [B, 128] (BPE tokens)
-    │
-    ▼
-VQ-VAE.get_ncm_inputs()
-    │
-    ├─▶ x: [B, 128, 11]  (multi-level codes)
-    └─▶ targets: [B, 128] (level-0 tokens)
-    
-For each level 0..10:
-    level_tokens = x[:, :, level]  # [B, 128]
-    logits, loss = model(level_tokens, level=level, targets=targets)
-    total_loss += loss
-    
-    # Router losses from all MoE blocks
-    router_loss = mean(block.mlp.router_loss for block in blocks)
-    total_loss += 0.01 * router_loss
+Input tokens [B, T]
+  → Embeddings → [B, T, D]
+  → for each layer:
+      if layer in engram_layers:
+          x = EngramMemory(x, tokens, layer_idx)  # additive injection
+      x = Block(x, cos, sin, mask, kv_cache)
+  → FinalNorm → OutputHead → logits [B, T, V]
+  → CrossEntropy(shift_logits, shift_labels)
 ```
 
-### Generation (Autoregressive, Level-by-Level)
+### Inference / Generation
 ```
-Level 0: Sample from unigram → l0 [B, 1]
+Prompt → Tokenize → [B, T]
+  → model.reset_kv_cache()
+  → for each new token:
+      logits = model(current_ids[-1:], use_cache=True)
+      next_token = sample(logits[-1] / temp)
+      append to sequence
+      if eos or max_len: break
+```
 
-For level in 1..10:
-    # Build context from all previous levels
-    ctx = cat([l0, l1, ..., l_{level-1}], dim=-1)  # [B, sum_T]
-    
-    # Forward with KV cache
-    logits, _ = model(ctx, level=level, kv_cache=kv_cache)
-    
-    # Sample next token
-    logits = logits[:, -1] / temp
-    next_token = sample(logits)
-    generated.append(next_token)
-
-Return cat(generated)  # [B, 11] tokens across all levels
+### Training with Feedback
+```
+psudo script → Transpiler → Rust → cargo check
+    ↓ (error)
+LSP/Rustc diagnostics → Harness formats correction pair
+    ↓
+psudo-engine/data/feedback_loop/corrections_xxx.jsonl
+    ↓
+Trainer: batch = mix(base_grammar + feedback) → train_step()
 ```
 
 ---
 
 ## Memory Management
 
-### VRAM Allocation (4GB Budget)
+### VRAM Budget (4GB Target)
 
-| Component | Precision | Size | Notes |
-|-----------|-----------|------|-------|
-| Tokenizer (VQ-VAE) | BF16 | ~50 MB | Frozen |
-| Embeddings (wte, wle, wpe) | BF16 | ~30 MB | |
-| Transformer trunk (attn + LN) | BF16 | ~400 MB | 12 layers |
-| Engram tables (2 sites) | BF16 | ~67 MB | 33.6M params |
-| Engram projections | BF16 | ~10 MB | |
-| MoE routers (12 × 64 × 768) | BF16 | ~12 MB | |
-| Resident experts (32) | BF16 | ~470 MB | Dynamic |
-| KV cache (INT8) | INT8 | ~200 MB | 12 layers × 256 × 12 × 64 |
-| Activations (BF16) | BF16 | ~1.0 GB | Peak during forward |
-| Gradients | BF16 | ~500 MB | |
-| Optimizer states (AdamW) | FP32 | ~1.0 GB | 2× params |
-| **Total** | | **~3.8 GB** | < 4 GB |
+| Component | 256d/2L | 512d/12L | 512d/24L |
+|-----------|---------|----------|----------|
+| Ternary weights | ~15 MB | ~180 MB | ~360 MB |
+| Engram tables | ~20 MB | ~67 MB | ~67 MB |
+| Resident experts | ~20 MB | ~470 MB | ~470 MB |
+| KV Cache (INT8) | ~10 MB | ~60 MB | ~120 MB |
+| Activations/grads | ~50 MB | ~400 MB | ~800 MB |
+| **Total** | **~21 MB** | **~286 MB** | **~650 MB** |
 
-### SSD Storage
-- 768 experts × 14.7 MB = ~11.3 GB
-- Safetensors format for fast mmap loading
-- JSON index for metadata
+### Expert Paging
+- **Disk**: 64 experts × 24 layers × 3 tensors × BF16 ≈ 11 GB SSD
+- **VRAM**: 32 resident experts (LRU)
+- **Load**: `pager.ensure_resident(layer, expert_ids)` on-demand
 
-### Expert Initialization (K-means Distillation)
-```python
-# From dense NCM checkpoint
-dense_fc = state_dict['transformer.blocks.{i}.mlp.c_fc.weight']  # [3072, 768]
-dense_proj = state_dict['transformer.blocks.{i}.mlp.c_proj.weight']  # [768, 3072]
-
-# Combine for clustering
-combined = cat([fc, proj.T], axis=1)  # [3072, 1536]
-kmeans = KMeans(n_clusters=64).fit(combined)
-
-# Split centroids
-fc_centroids = centroids[:, :768]  # [64, 768]
-proj_centroids = centroids[:, 768:].T  # [768, 64]
-
-# Expand to full expert size with noise
-for e in 0..63:
-    gate = fc_centroids[e].repeat(3072, 1) + noise
-    up   = fc_centroids[e].repeat(3072, 1) + noise
-    down = proj_centroids[:, e].repeat(1, 3072) + noise
-```
+### KV Cache
+- **Disk**: None (all in VRAM, INT8)
+- **Max window**: 256 tokens per layer
+- **Sink**: 1 token pinned permanently
 
 ---
 
@@ -428,142 +258,205 @@ for e in 0..63:
 
 ### Two-Timescale Optimizer
 ```python
-optimizer = AdamW([
-    {'params': trunk_params,      'lr': 3e-4,  'wd': 0.1},
-    {'params': engram_table_params, 'lr': 1e-4,  'wd': 0.01},
-    {'params': expert_params,     'lr': 3e-3,  'wd': 0.1},
-], betas=(0.9, 0.95), fused=True)
-
-scheduler = LambdaLR(optimizer, lr_lambda):
-    warmup_steps=1000: linear
-    50000 steps: cosine decay
+param_groups = [
+    {'params': trunk_params,     'lr': 3e-4},   # attention, embeddings
+    {'params': engram_params,    'lr': 1e-4},   # engram tables
+    {'params': expert_params,    'lr': 3e-3},   # MoE experts (10×)
+]
+optimizer = AdamW(param_groups, weight_decay=0.1, betas=(0.9, 0.95))
 ```
 
-### Gradient Clipping
+### STE Gradient Flow (Ternary)
 ```python
-# Only trunk + engram + currently routed experts
-routed_experts = model.get_routed_expert_params()
-clip_grad_norm_(trunk + engram + routed_experts, max_norm=1.0)
+# Forward: w_q = ternary_quantize(w)
+# Backward: grad_w = grad_output * scale  (STE)
 ```
 
-### Checkpointing
+### Gradient Accumulation
 ```python
-# Every 1000 steps
-torch.save({
-    'model': model.state_dict(),
-    'optimizer': optimizer.state_dict(),
-    'scheduler': scheduler.state_dict(),
-    'step': step,
-}, f'checkpoints/step_{step}.pt')
+loss = loss / grad_accum  # 8
+loss.backward()
+if (step + 1) % grad_accum == 0:
+    clip_grad_norm_(1.0)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
+```
 
-# Also save resident experts to SSD
-for block in model.blocks:
-    block.mlp.pager.save_all_resident()
+### Curriculum Learning
+```
+Stage 1 (0-2k):   Basic syntax, simple functions
+Stage 2 (2k-5k):  Control flow, data structures  
+Stage 3 (5k-10k): File I/O, higher-order functions
+Stage 4 (10k+):   Full programs, error handling
+```
+
+### Feedback Integration
+```
+Dataset = (1 - ratio) * BaseGrammar + ratio * FeedbackCorrections
+Default ratio = 0.3
 ```
 
 ---
 
 ## Generation Pipeline
 
-### NCM Multi-Level Generation
+### Autoregressive Decoding
 ```python
-def generate(idx, l0=None, max_levels=11):
-    kv_cache.reset()
-    
-    if l0 is None:
-        l0 = sample(unigram)  # [B, 1]
-    
-    generated = [l0]
-    
-    for level in range(1, max_levels):
-        # Hierarchical conditioning: all previous levels
-        ctx = cat(generated, dim=-1)  # [B, sum_T]
-        
-        logits, _ = model(ctx, level=level, kv_cache=kv_cache)
-        logits = logits[:, -1] / temperature
-        
-        # Top-k / top-p sampling
-        if top_k > 0: logits = top_k_filter(logits, top_k)
-        if top_p < 1.0: logits = top_p_filter(logits, top_p)
-        
-        next_token = multinomial(softmax(logits), 1)
-        generated.append(next_token)
-    
-    return cat(generated, dim=-1)  # [B, 11]
-```
-
-### Key Differences from Standard AR
-1. **Level-by-level**: 11 forward passes per sample (not token-by-token)
-2. **Hierarchical context**: Each level sees all coarser levels
-3. **KV cache per level**: Resets between levels, accumulates within level
-4. **Engram at fixed layers**: Always layers 2, 15 regardless of level
-
----
-
-## Extension Points
-
-### Adding New Engram Sites
-```python
-model = MoEEngramNextConceptTransformer(
-    ...,
-    engram_config={"orders": [2,3], "slots": 8192, ...},
+generator.generate(
+    prompt="fn hello() -> string {",
+    config=GenerationConfig(
+        max_new_tokens=100,
+        temperature=0.8,
+        top_k=50,
+        top_p=0.9,
+        repetition_penalty=1.0,
+        use_cache=True
+    )
 )
-# Modify self.engram_layers in __init__
 ```
 
-### Custom Routing
-```python
-class CustomRouter(nn.Module):
-    def forward(self, x):
-        # Your routing logic
-        return weights, indices, logits
+### Sampling Pipeline
+```
+logits = model(last_token, use_cache=True)
+logits = logits / temperature
+logits = top_k(logits, k)  # if k > 0
+logits = top_p(logits, p)  # if p < 1.0
+logits = repetition_penalty(logits, prev_tokens)
+probs = softmax(logits)
+token = multinomial(probs)
 ```
 
-### Different Quantization
-```python
-# In kv_cache.py
-def quantize_int4(x):  # 4-bit
-    # ...
-    
-def dequantize_int4(q, scale):
-    # ...
-```
-
-### Distributed Training
-- MoE expert parallelism across GPUs
-- Each GPU holds subset of experts
-- All-to-all for routed tokens
+### KV Cache Management
+- `model.reset_kv_cache()` at sequence start
+- `kv_cache.get_mask(seq_len, layer_idx, device)` per layer
+- `kv_cache.update_layer(layer_idx, k, v)` per block
+- `model.reset_kv_cache()` between sequences
 
 ---
 
-## Performance Characteristics
+## Dual-Repository Sync Protocol
 
-| Metric | Value |
-|--------|-------|
-| Forward pass (1 level, B=4, T=128) | ~200ms CPU, ~50ms GPU |
-| Expert load (cache miss) | ~5ms SSD → VRAM |
-| Engram forward | ~10ms |
-| KV cache update | ~2ms |
-| Total training step (accum=8) | ~2s GPU |
-| Generation (11 levels) | ~2s GPU |
+### Repositories
+| Repo | Purpose | Key Files |
+|------|---------|-----------|
+| **psudo-engine** | Training & Model | Model, ternary layers, training scripts, datasets |
+| **psudo-harness** | Execution & Transpiler | Transpiler, LSP client, agent loop |
+
+### Shared Contract: `psudo-spec.json`
+```
+{
+  "version": "1.0.0",
+  "grammar": { "entry_point": "program", ... },
+  "builtins": [ {"name": "read_file", "signature": "(path: string) -> string"}, ... ],
+  "ast_nodes": { "FunctionDef": {...}, "IfStmt": {...}, ... },
+  "type_system": { "primitives": [...], "containers": [...], ... },
+  "transpiler": { "target": "rust", "dependencies": [...] }
+}
+```
+
+### Version Locking
+```yaml
+# Both repos: config/training.yaml and config/transpiler.yaml
+schema_version: "1.0.0"
+```
+
+### Reflexion Loop
+```
+1. Model generates psudo script
+2. Harness transpiles → Rust
+3. cargo check / rust-analyzer LSP
+4. On error: Harness captures stderr/LSP JSON
+5. Harness formats correction pair:
+   { prompt, faulty_code, error_message, corrected_code }
+6. Appended to feedback_loop/corrections_xxx.jsonl
+7. Periodic sync → psudo-engine/data/feedback_loop/
+8. Trainer mixes feedback into training batches (ratio 0.3)
+```
+
+### Sync Procedure
+```bash
+# 1. Update schema
+git submodule update --remote  # or vendor copy
+
+# 2. Bump version in psudo-spec.json
+# "version": "1.1.0"
+
+# 3. Update both repos
+# psudo-engine: config.schema_version = "1.1.0"
+# psudo-harness: transpiler.spec_version = "1.1.0"
+
+# 4. Coordinated release
+git tag v1.1.0-engine
+git tag v1.1.0-harness
+```
 
 ---
 
-## Debugging Hooks
+## Benchmarks
 
-```python
-# Log router statistics
-router_entropy = block.mlp.router_loss
-expert_usage = pager.get_memory_usage()
+### VRAM Usage (GTX 1660 Ti 6GB)
+| Model | Peak VRAM | Tokens/sec | ms/token |
+|-------|-----------|------------|----------|
+| Small (256d, 2L) | 21 MB | 47 | 21 ms |
+| Medium (512d, 12L) | 286 MB | 11 | 89 ms |
 
-# Log Engram gate statistics
-gate_mean = engram.gate.mean().item()  # Should be ~0.3-0.7
+### Latency Breakdown
+| Phase | Small | Medium |
+|-------|-------|--------|
+| Prefill | 24 ms | 118 ms |
+| Decode/token | 21 ms | 89 ms |
 
-# Log KV cache stats
-window_len = kv_cache.get_window_len(layer_idx)
-total_len = kv_cache.get_total_len(layer_idx)
+---
 
-# Monitor VRAM
-allocated = torch.cuda.memory_allocated() / 1e9
-reserved = torch.cuda.memory_reserved() / 1e9
+## Testing
+
+```bash
+# All tests
+PYTHONPATH=. .venv/Scripts/python.exe -m pytest psudo_engine/tests/ -v
+
+# Integration tests (13 tests, 10 passing)
+pytest psudo_engine/tests/test_integration.py -v
+
+# Unit tests
+pytest psudo_engine/tests/test_weight_paging.py -v
+pytest psudo_engine/tests/test_context.py -v
+pytest psudo_engine/tests/test_model.py -v
+
+# Benchmarks
+PYTHONPATH=. .venv/Scripts/python.exe psudo_engine/benchmarks/benchmark.py
 ```
+
+---
+
+## File Index
+
+| Path | Description |
+|------|-------------|
+| `psudo_engine/weight_paging/weight_store.py` | Layer chunk serialization |
+| `psudo_engine/weight_paging/ternary.py` | Ternary quantization (BitNet 1.58b) |
+| `psudo_engine/weight_paging/dequantizer.py` | Batch dequant on VRAM entry |
+| `psudo_engine/weight_paging/page_controller.py` | LRU eviction page controller |
+| `psudo_engine/context/ast_indexer.py` | tree-sitter Python/Rust parsing |
+| `psudo_engine/context/syntax_hub.py` | Markdown rule files + indexing |
+| `psudo_engine/context/retriever.py` | BM25 + embedding retrieval |
+| `psudo_engine/context/context_builder.py` | Token-budgeted context assembly |
+| `psudo_engine/model/blocks.py` | RMSNorm, Attention, TransformerBlock |
+| `psudo_engine/model/attention.py` | Causal attention + BoundedKVCache |
+| `psudo_engine/model/moe.py` | Top-2 router + paged experts |
+| `psudo_engine/model/engram.py` | Hashed n-gram (2/3-gram) |
+| `psudo_engine/model/kv_cache.py` | BoundedKVCache (256-window + INT8) |
+| `psudo_engine/model/psudo_transformer.py` | Full model assembly |
+| `psudo_engine/training/psudo_dataset.py` | psudo script dataset |
+| `psudo_engine/training/feedback_dataset.py` | Base + feedback merge |
+| `psudo_engine/training/ternary_trainer.py` | STE training loop |
+| `psudo_engine/training/curriculum.py` | Difficulty progression |
+| `psudo_engine/training/train.py` | Main training entry |
+| `psudo_engine/training/schema_check.py` | Schema version validation |
+| `psudo_engine/inference/tokenizer.py` | BPE tokenizer |
+| `psudo_engine/inference/generator.py` | Autoregressive generator |
+| `psudo_engine/inference/cli.py` | Demo CLI |
+| `psudo_engine/benchmarks/benchmark.py` | Benchmark suite |
+| `psudo_engine/data/psudo-spec.json` | Shared schema |
+| `docs/sync_protocol.md` | Sync protocol docs |
+| `tests/test_integration.py` | 13 integration tests |

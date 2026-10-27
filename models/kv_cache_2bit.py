@@ -7,13 +7,10 @@ Implements a 256-token sliding window with permanently pinned attention sinks
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, List
 
 from models.cq_quantize import (
     cq_quantize_kv,
     dequantize_kv_cq,
-    CQ_GROUP_SIZE,
-    WEIGHT_BITS,
 )
 
 
@@ -90,7 +87,7 @@ class BoundedKVCache2Bit(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Update KV cache with new tokens.
         
@@ -224,7 +221,7 @@ class MultiLayerKVCache2Bit(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.caches[layer_idx].update(k, v, layer_idx)
     
     def get_mask(self, query_len: int, layer_idx: int, device: torch.device) -> torch.Tensor:

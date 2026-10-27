@@ -3,14 +3,12 @@ Expert initialization using FAISS GPU-accelerated KMeans.
 Much faster than sklearn KMeans on CPU.
 """
 
-import torch
-import torch.nn as nn
-import numpy as np
 import faiss
-from omegaconf import OmegaConf
+import logging
+import numpy as np
 import os
 import time
-import logging
+import torch
 from utils.expert_io import MoEPager
 
 
@@ -43,7 +41,7 @@ def init_experts_from_dense_faiss(
     logger.info(f"Loading dense checkpoint from {dense_checkpoint}...")
     ckpt = torch.load(dense_checkpoint, map_location='cpu')
     state_dict = ckpt['model']
-    
+
     # Create pager for saving
     pager = MoEPager(
         expert_dir=expert_dir,
@@ -53,7 +51,7 @@ def init_experts_from_dense_faiss(
         d_model=d_model,
         expert_hidden=expert_hidden,
     )
-    
+
     # Check which layers are already complete
     completed_layers = []
     for layer_idx in range(n_layers):

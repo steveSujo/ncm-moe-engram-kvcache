@@ -7,9 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-27
+
+### Added - psudo-Engine Rewrite
+
+- **Complete Architecture Rewrite**: New psudo-Engine - paged-weight hybrid coding agent
+- **Weight Paging Subsystem** (mini-AGI style):
+  - `weight_store.py` - Layer chunk serialization with safetensors mmap
+  - `ternary.py` - BitNet 1.58b ternary quantization ({-1, 0, +1}) with STE
+  - `dequantizer.py` - Batch dequantization on VRAM entry (eliminates bit-shifting)
+  - `page_controller.py` - LRU eviction page controller with sequential prefetch
+- **Context & Retrieval Subsystem** (Needle 2 style):
+  - `ast_indexer.py` - tree-sitter Python/Rust parsing for function signatures
+  - `syntax_hub.py` - Modular Markdown syntax rules with priority indexing
+  - `retriever.py` - Hybrid BM25 + all-MiniLM-L6-v2 embeddings with RRF fusion
+  - `context_builder.py` - Token-budgeted (<1500 tokens) context assembly
+- **Model Architecture** (30-50M params, ternary):
+  - `psudo_transformer.py` - Full PsudoTransformer assembly
+  - `blocks.py` - RMSNorm, MultiHeadAttention, SwiGLU, TransformerBlock
+  - `attention.py` - Causal attention with BoundedKVCache
+  - `moe.py` - Top-2 router, paged expert execution (64 experts/layer)
+  - `engram.py` - Hashed n-gram lookup (2-gram + 3-gram), 4 heads, 8192 slots
+  - `kv_cache.py` - BoundedKVCache (256-token window + INT8 + sinks)
+- **Training Pipeline & Feedback Integration**:
+  - `ternary_trainer.py` - STE forward/backward, two-timescale optimizer
+  - `curriculum.py` - Difficulty progression (Beginner → Expert)
+  - `psudo_dataset.py` / `feedback_dataset.py` - psudo script datasets + feedback loop
+  - `train.py` - Main training loop with schema version checking
+- **Inference Pipeline**:
+  - `tokenizer.py` - BPE tokenizer for psudo vocabulary
+  - `generator.py` - Autoregressive with weight paging, streaming, chat mode
+  - `cli.py` - Demo CLI (generate, chat, benchmark, tokenize, info)
+- **Shared Schema & Integration**:
+  - `psudo-spec.json` - Grammar, builtins, AST types (single source of truth)
+  - `schema_check.py` - Version validation for training/transpiler
+  - `docs/sync_protocol.md` - Sync protocol between psudo-engine & psudo-harness
+- **Dual-Repository Architecture**:
+  - **psudo-engine** (this repo): Training, model, datasets
+  - **psudo-harness** (separate): Transpiler, LSP client, agent loop
+  - Shared contract: `psudo-spec.json` (grammar, builtins, AST types)
+  - Reflexion correction loop: Model → Transpiler → Compiler/LSP → Correction pairs → Dataset
+
+### Changed
+- **Architecture**: Complete rewrite from NCM-MoE-Engram-KVCache to psudo-Engine
+- **Target**: Now ~30-50M ternary params (was ~200M sparse BF16)
+- **Vocabulary**: psudo pseudocode tokens (8192) instead of NCM codes
+- **Task**: Causal psudo script generation (was NCM multi-level)
+- **Precision**: Ternary ({-1, 0, +1}) with STE (was BF16)
+
+### Infrastructure
+- `benchmarks/benchmark.py` - VRAM/latency/quality benchmark suite
+- `tests/test_integration.py` - 13 integration tests (10 passing)
+- `tests/test_weight_paging.py`, `test_context.py`, `test_model.py` - Unit tests
+- `docs/sync_protocol.md` - Sync protocol documentation
+- `psudo-spec.json` - Shared grammar/builtins/AST contract
+
 ## [0.1.0] - 2024-XX-XX
 
-### Added
+### Added - Original NCM-MoE-Engram-KVCache
+
 - **Core Architecture**: NCM-MoE-Engram-KVCache model combining four sparsity techniques
 - **NCM Tokenizer** (frozen): Pre-trained HazyResearch VQ-VAE + multiscale residual VQ (TinyStories)
 - **NCM Generator**: Parallel coarse-to-fine transformer (11 levels, block-diagonal attention, tied heads)
@@ -76,7 +132,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/en/
 
 ### Examples
 ```
-feat(enggram): add sigmoid-gated attention for Engram fusion
+feat(engram): add sigmoid-gated attention for Engram fusion
 fix(kv_cache): resolve dtype mismatch in attention computation
 docs(readme): update install instructions to use requirements.txt
 refactor(moe): simplify expert loading logic

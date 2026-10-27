@@ -1,5 +1,6 @@
 """
 MoE + Engram + KV Cache Enhanced NCM Generator
+===============================================
 
 Integrates:
 - NCM parallel coarse-to-fine transformer
@@ -12,382 +13,287 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, ListConfig
 import os
 
 from models.common import Block, SelfAttention, MLP, RMSNorm
 from models.engram import EngramModule, needle2_engram_config, engram_geometry
 from models.kv_cache import BoundedKVCache, MultiLayerKVCache
 from models.moe_block import MoEBlock
+from models.block_2bit import Block2Bit
 from utils.expert_io import MoEPager
 
 
 class MoEEngramNextConceptTransformer(nn.Module):
     """
-    Enhanced NCM Generator with:
-    - MoE FFN layers (paged from SSD)
-    - Engram memory at layers 2, 15
-    - Bounded KV cache (256 window + 1 sink + INT8)
+    NCM Generator with MoE + Engram + Bounded KV Cache.
     """
-
+    
     def __init__(
         self,
         vqvae_local,
         config,
         expert_dir: str = "experts",
-        resident_slots: int = 32,
-        engram_config: Optional[dict] = None,
-        kv_cache_config: Optional[dict] = None,
-        pager: Optional["MoEPager"] = None,
-        device: Optional[torch.device] = None,
     ):
         super().__init__()
-
         self.vqvae_local = vqvae_local
         self.config = config
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.expert_dir = expert_dir
-
-        # Extract model params
+        
+        # Model dimensions
+        self.n_embd = config.n_embd
         self.n_layer = config.n_layer
         self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.vocab_size = config.vocab_size
-        self.context_length = config.context_length
-        self.prefix_len = config.prefix_len
-        self.tie_heads_to_codebook = config.tie_heads_to_codebook
-
-        # Embeddings
-        vocab_size_0 = int(config.vocab_size[0]) if hasattr(config.vocab_size, '__getitem__') else int(config.vocab_size)
-        self.wte = nn.Embedding(vocab_size_0, config.n_embd)
-        self.wle = nn.Embedding(len(config.vocab_size), config.n_embd) if config.use_level_encoding else None
-        # Use max sequence length for positional embeddings (NCM uses 640 = sum of levels 1-11)
-        max_seq_len = getattr(config, 'max_seq_len', config.context_length)
-        if max_seq_len < 640:
-            max_seq_len = 640
-        self.wpe = nn.Embedding(max_seq_len, config.n_embd) if config.use_positional_encoding else None
-
+        self.n_kv_head = getattr(config, "n_kv_head", config.n_head)
+        self.head_dim = self.n_embd // self.n_head
+        # vocab_size can be ListConfig (OmegaConf) or list/tuple/int
+        from omegaconf import ListConfig
+        if isinstance(config.vocab_size, (list, tuple, ListConfig)) and hasattr(config.vocab_size, '__len__'):
+            self.vocab_size = int(config.vocab_size[0])
+        else:
+            self.vocab_size = int(config.vocab_size)
+        self.max_seq_len = getattr(config, "max_seq_len", config.get("context_length", 128))
+        
+        # Engram configuration
+        self.engram_layers = getattr(config, "engram_layers", [2, 11])
+        self.engram_config = needle2_engram_config()
+        if hasattr(config, "engram"):
+            self.engram_config.update(config.engram)
+        
+        # Quantization settings
+        self.bits = 2.0  # WEIGHT_BITS
+        self.group_size = 128  # CQ_GROUP_SIZE
+        
+        # Token embeddings (keep BF16)
+        # vocab_size can be a list (NCM multi-level), use first level
+        vocab_size = int(config.vocab_size[0]) if hasattr(config.vocab_size, '__getitem__') else config.vocab_size
+        self.wte = nn.Embedding(vocab_size, self.n_embd)
+        self.wpe = nn.Embedding(self.max_seq_len, self.n_embd)
+        
+        # Level embeddings for NCM (keep BF16)
+        self.n_levels = getattr(config, "n_levels", 11)
+        self.wle = nn.Embedding(self.n_levels, self.n_embd)
+        
         # Dropout
-        self.drop = nn.Dropout(config.dropout)
-
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            Block(config) for _ in range(config.n_layer)
-        ])
-
-        # Replace MLP with MoEBlock
-        if pager is None:
-            from utils.expert_io import MoEPager
-            pager = MoEPager(
-                expert_dir=expert_dir,
-                resident_slots=resident_slots,
-                n_layers=config.n_layer,
-                n_experts=64,
-                d_model=config.n_embd,
-                expert_hidden=3072,
-                device=self.device,
-            )
-
-        for i, block in enumerate(self.blocks):
-            block.mlp = MoEBlock(config, layer_idx=i, pager=pager)
-
-        self.pager = pager
-        self.ln_f = RMSNorm(config.n_embd)
-
-        # Output heads (tied to codebook - 384 dim from VQ-VAE)
-        codebook_dim = 384
-        self.lm_heads = nn.ModuleList([
-            nn.Linear(codebook_dim, vs, bias=False) for vs in config.vocab_size
-        ])
-
-        # Projection from model dim to codebook dim
-        self.proj_to_codebook = nn.Linear(config.n_embd, codebook_dim, bias=False)
-
-        # Projection from codebook dim to model dim (matches NCM transformer.wte: [768, 384])
-        self.proj_from_codebook = nn.Linear(codebook_dim, config.n_embd, bias=False)
-
-        engram_cfg = engram_config or needle2_engram_config()
-        orders, num_heads, sub_dim = engram_geometry(engram_cfg)
-        self.engram_layers = [2, 15] if config.n_layer > 15 else [2, min(11, config.n_layer - 1)]
-        self.engrams = nn.ModuleList([
-            EngramModule(
-                config.n_embd, orders, num_heads, sub_dim,
-                engram_cfg["slots"], engram_cfg["conv_taps"],
-                engram_cfg["conv_dilation"]
-            )
-            for _ in self.engram_layers
-        ])
-
-        kv_cfg = kv_cache_config or {}
-        self.kv_cache = MultiLayerKVCache(
-            n_layers=config.n_layer,
-            max_window=kv_cfg.get("max_window", 256),
-            sink_tokens=kv_cfg.get("sink_tokens", config.prefix_len),
-            n_kv_heads=kv_cfg.get("n_kv_heads", config.n_head),  # MHA for compatibility
-            head_dim=kv_cfg.get("head_dim", config.n_embd // config.n_head),
+        self.drop = nn.Dropout(getattr(config, "embd_dropout", 0.0))
+        
+        # Expert pager (created before blocks)
+        from utils.expert_io import MoEPager
+        self.pager = MoEPager(
+            expert_dir=expert_dir,
+            n_layers=self.n_layer,
+            n_experts=64,
+            d_model=self.n_embd,
+            expert_hidden=3072,
+            resident_slots=getattr(config, "moe_resident_slots", 32),
+            device='cuda' if torch.cuda.is_available() else 'cpu',
         )
-
+        
+        # Transformer blocks (2-bit)
+        self.blocks = nn.ModuleList([
+            Block2Bit(
+                config,
+                layer_idx=i,
+                pager=self.pager,  # Pass pager to blocks
+                engram_layers=self.engram_layers,
+                engram_config=self.engram_config,
+            )
+            for i in range(self.n_layer)
+        ])
+        
+        # Final norm (FP32)
+        self.ln_f = RMSNorm(self.n_embd, bias=config.bias)
+        
+        # Output heads per level (keep BF16)
+        self.lm_heads = nn.ModuleList([
+            nn.Linear(self.n_embd, self.vocab_size, bias=False)
+            for _ in range(self.n_levels)
+        ])
+        
+        # Tie weights
+        for level in range(self.n_levels):
+            self.lm_heads[level].weight = self.wte.weight
+        
+        # KV Cache (2-bit)
+        self.kv_cache = None
+        
         # Initialize weights
         self.apply(self._init_weights)
-
-        # Tie weights if needed
-        if self.tie_heads_to_codebook:
-            self._tie_heads_to_codebook()
-
+    
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
-                nn.init.zeros_(module.bias)
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, std=0.02)
-
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
     def _tie_heads_to_codebook(self):
         """Tie output heads to VQ codebook embeddings."""
-        codebooks = self.vqvae_local.get_codebooks()  # [n_levels, vocab_size, embed_dim]
+        codebooks = self.vqvae_local.get_codebooks()
         for level, head in enumerate(self.lm_heads):
             if level < len(codebooks):
                 head.weight.data = codebooks[level].to(head.weight.dtype).clone()
-
+    
+    def init_kv_cache(self, batch_size: int, device: torch.device):
+        """Initialize 2-bit KV cache."""
+        self.kv_cache = MultiLayerKVCache2Bit(
+            n_layers=self.n_layer,
+            max_window=getattr(self.config, "kv_cache_window", 256),
+            sink_tokens=getattr(self.config, "kv_cache_sink", 1),
+            n_heads=self.n_kv_head,
+            head_dim=self.head_dim,
+            bits=self.bits,
+            group_size=64,  # Smaller group for KV
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    
+    def reset_kv_cache(self):
+        """Reset KV cache."""
+        if self.kv_cache is not None:
+            self.kv_cache.reset()
+    
     def forward(
         self,
-        x: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
-        kv_cache: Optional[MultiLayerKVCache] = None,
-    ):
-        """Main forward - dispatches to multilevel if input is 3D (concatenated), else single level."""
-        if x.dim() == 3:
-            return self.forward_multilevel(x, targets)
-        else:
-            # Single level forward (for generation) - x is [B, T] token indices
-            # Need to know which level - default to level 0
-            return self.forward_single_level(x, level=0, targets=targets, kv_cache=kv_cache)
-
-    def forward_multilevel(
-        self,
-        x: torch.Tensor,  # [B, sum_levels, embed_dim] concatenated multi-level codes
-        targets: Optional[torch.Tensor] = None,  # [B, sum_levels] flattened
+        idx: torch.Tensor,
+        level: torch.Tensor = None,
+        targets: torch.Tensor = None,
+        attn_mask: torch.Tensor = None,
+        rope_cos_sin: Tuple[torch.Tensor, torch.Tensor] = None,
+        use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Forward pass for all levels simultaneously (NCM style).
-
+        Forward pass.
+        
         Args:
-            x: [B, sum_levels, embed_dim] concatenated multi-level codes from VQ-VAE
-            targets: [B, sum_levels] flattened target indices for all levels
+            idx: [B, T] token indices
+            level: [B, T] level indices (for NCM)
+            targets: [B, T] target tokens (for loss computation)
+            attn_mask: Attention mask
+            rope_cos_sin: RoPE cos/sin tables
+            use_cache: Whether to use KV cache
+            
         Returns:
-            logits: [B, sum_levels, vocab_size] concatenated logits for all levels
-            loss: scalar if targets provided
-        """
-        B, sum_T, embed_dim = x.shape
-        device = x.device
-        dtype = next(self.parameters()).dtype
-
-        # x is already flattened: [B, sum_levels, embed_dim]
-        x_flat = x
-
-        # Project from VQ-VAE codebook dim (384) to model dim (768)
-        # This matches NCM's transformer.wte: [768, 384]
-        x_flat = self.proj_from_codebook(x_flat)
-
-        # Add level embeddings using lvl_1L (like NCM)
-        if self.wle is not None and hasattr(self, 'lvl_1L'):
-            lvl_emb = self.wle(self.lvl_1L).squeeze(0)  # [sum_levels, n_embd]
-            x_flat = x_flat + lvl_emb.unsqueeze(0)
-        elif self.wle is not None:
-            # Fallback: create level indices
-            level_indices = torch.arange(len(self.vocab_size), device=device).repeat_interleave(
-                torch.tensor([min(128, vs) for vs in self.vocab_size], device=device)
-            )
-            lvl_emb = self.wle(level_indices)  # [sum_levels, n_embd]
-            x_flat = x_flat + lvl_emb.unsqueeze(0)
-
-        # Add positional embeddings
-        if self.wpe is not None:
-            pos = torch.arange(sum_T, device=device).unsqueeze(0)
-            pos_emb = self.wpe(pos)
-            x_flat = x_flat + pos_emb
-
-        x_flat = self.drop(x_flat)
-        x_flat = x_flat.to(dtype)
-
-        # Forward through blocks with gradient checkpointing
-        from torch.utils.checkpoint import checkpoint
-
-        def block_forward(block, x, layer_idx):
-            # Engram injection at specified layers
-            if layer_idx in self.engram_layers:
-                engram_idx = self.engram_layers.index(layer_idx)
-                dummy_idx = torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand(x.shape[0], -1)
-                x = self.engrams[engram_idx].apply_engam(x, dummy_idx)
-            return block(x, kv_cache=None, layer_idx=layer_idx)
-
-        # Forward through blocks with gradient checkpointing
-        for i, block in enumerate(self.blocks):
-            x_flat = checkpoint(block_forward, block, x_flat, i, use_reentrant=False)
-
-        x_flat = self.ln_f(x_flat)
-
-        # Project to codebook dimension
-        x_flat = self.proj_to_codebook(x_flat)
-
-        # Apply level-specific heads
-        # Need to split by level boundaries using VQ-VAE level sizes (excluding level 0)
-        # VQ-VAE levels: [1, 8, 16, 24, 32, 40, 52, 64, 76, 92, 108, 128]
-        # Skip level 0 (prefix): [8, 16, 24, 32, 40, 52, 64, 76, 92, 108, 128] = 640
-        vq_levels = [1, 8, 16, 24, 32, 40, 52, 64, 76, 92, 108, 128]
-        level_sizes = vq_levels[1:]  # Skip level 0 (prefix)
-
-        logits_list = []
-        start = 0
-        for level, level_T in enumerate(level_sizes):
-            end = start + level_T
-            level_x = x_flat[:, start:end, :]
-            level_logits = self.lm_heads[level](level_x)  # [B, level_T, vocab_size]
-            logits_list.append(level_logits)
-            start = end
-
-        logits = torch.cat(logits_list, dim=1)  # [B, sum_levels, vocab_size]
-
-        loss = None
-        if targets is not None:
-            # targets is [B, sum_levels] flattened
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        return logits, loss
-
-    def forward_single_level(
-        self,
-        idx: torch.Tensor,  # [B, T] token indices
-        level: int = 0,
-        targets: Optional[torch.Tensor] = None,
-        kv_cache: Optional[MultiLayerKVCache] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass for a single level (used during generation).
-
-        Args:
-            idx: [B, T] token indices for current level
-            level: which level (0-10)
-            targets: [B, T] target tokens for loss
-            kv_cache: optional KV cache for autoregressive generation
-        Returns:
-            logits: [B, T, vocab_size]
-            loss: scalar if targets provided
+            logits: [B, T, V] or [B, T, n_levels, V] if level provided
+            loss: Optional loss tensor
         """
         B, T = idx.shape
         device = idx.device
-        dtype = next(self.parameters()).dtype
-
-        # Token embeddings
-        tok_emb = self.wte(idx)  # [B, T, n_embd]
-
-        # Level embedding
-        if self.wle is not None:
-            lvl_emb = self.wle(torch.full((B, T), level, dtype=torch.long, device=device))
-            tok_emb = tok_emb + lvl_emb
-
-        # Positional embeddings
-        if self.wpe is not None:
-            pos = torch.arange(T, device=device).unsqueeze(0)
-            pos_emb = self.wpe(pos)
-            tok_emb = tok_emb + pos_emb
-
-        x = self.drop(tok_emb)
-        x = x.to(dtype)  # Ensure model dtype (BF16)
-
-        # Use provided KV cache or internal
-        cache = kv_cache or self.kv_cache
-
-        # Forward through blocks
+        
+        # Initialize KV cache if needed
+        if use_cache and self.kv_cache is None:
+            self.init_kv_cache(B, device)
+        
+        # Embeddings
+        tok_emb = self.wte(idx)  # [B, T, D]
+        pos_emb = self.wpe(torch.arange(T, device=device).unsqueeze(0))  # [1, T, D]
+        x = self.drop(tok_emb + pos_emb)
+        
+        # Add level embeddings if provided
+        if level is not None:
+            lvl_emb = self.wle(level)
+            x = x + lvl_emb
+        
+        # Transformer blocks
         for i, block in enumerate(self.blocks):
-            # Engram injection at specified layers
-            if i in self.engram_layers:
-                engram_idx = self.engram_layers.index(i)
-                # Engram applies to residual stream before attention
-                # Need tokens for hashing - use input idx
-                engram_out = self.engrams[engram_idx].apply_engam(x, idx)
-                x = engram_out
-
-            # Block forward with KV cache
-            x = block(x, kv_cache=cache, layer_idx=i)
-
+            x = block(
+                x,
+                attn_mask=attn_mask,
+                rope_cos_sin=rope_cos_sin,
+                kv_cache=self.kv_cache if use_cache else None,
+            )
+        
+        # Final norm
         x = self.ln_f(x)
-
-        # Project to codebook dimension
-        x = self.proj_to_codebook(x)
-
-        # Level-specific head
-        logits = self.lm_heads[level](x)  # [B, T, vocab_size]
+        
+        # Output heads
+        if level is not None:
+            # Multi-level output: [B, T, n_levels, V]
+            logits = torch.stack([head(x) for head in self.lm_heads], dim=2)
+        else:
+            # Single level (default level 0)
+            logits = self.lm_heads[0](x)
+        
+        # Loss computation
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
+            if level is not None:
+                # Multi-level loss
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1)
+                )
+            else:
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.vocab_size), targets.view(-1))
+        
         return logits, loss
-
+    
     def generate(
         self,
         idx: torch.Tensor,
-        l0: Optional[torch.Tensor] = None,
+        level: torch.Tensor = None,
+        max_new_tokens: int = 100,
         temperature: float = 1.0,
-        top_k: int = 0,
-        top_p: float = 1.0,
-        cfg_scale: float = 0.0,
-        max_levels: int = 11,
-        use_kv_cache: bool = True,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        eos_token_id: int = None,
     ) -> torch.Tensor:
-        """
-        Autoregressive generation across all levels.
-
-        NCM generates level by level (coarse to fine).
-        """
+        """Generate tokens autoregressively with KV cache."""
         self.eval()
-
-        # Reset KV cache for generation
-        if use_kv_cache:
-            self.kv_cache.reset()
-
-        # Level 0: unigram or provided
-        if l0 is None:
-            # Sample from unigram
-            unigram = self.vqvae_local.get_unigram()  # [vocab_size]
-            l0 = torch.multinomial(unigram, num_samples=idx.size(0), replacement=True)
-            l0 = l0.to(idx.device).unsqueeze(-1)  # [B, 1]
-        else:
-            l0 = l0.unsqueeze(-1) if l0.dim() == 1 else l0
-
-        generated = [l0]
-
-        for level in range(1, max_levels):
-            # Build input for this level: prefix + all previous levels
-            # NCM uses hierarchical conditioning
-            # For simplicity, concatenate all previous level tokens
-            ctx = torch.cat(generated, dim=-1)  # [B, sum_T]
-
-            # Forward with KV cache
-            logits, _ = self.forward_single_level(ctx, level=level, kv_cache=self.kv_cache if use_kv_cache else None)
-
-            # Sample next token
-            logits = logits[:, -1, :] / temperature  # [B, vocab]
-
+        
+        # Enable KV cache for generation
+        self.init_kv_cache(idx.shape[0], idx.device)
+        
+        for _ in range(max_new_tokens):
+            # Forward with cache
+            logits, _ = self.forward(
+                idx[:, -1:] if idx.shape[1] > 0 else idx,
+                level=level[:, -1:] if level is not None and level.shape[1] > 0 else level,
+                use_cache=True,
+            )
+            
+            # Get next token logits
+            next_logits = logits[:, -1, :] / temperature
+            
+            # Top-k sampling
             if top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('inf')
-
+                v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                next_logits[next_logits < v[:, [-1]]] = -float('inf')
+            
+            # Top-p sampling
             if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumprobs > top_p
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
                 sorted_indices_to_remove[:, 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = -float('inf')
-
-            probs = F.softmax(logits, dim=-1)
+                next_logits[indices_to_remove] = -float('inf')
+            
+            # Sample
+            probs = F.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            generated.append(next_token)
-
-        return torch.cat(generated, dim=-1)
-
+            
+            # Append
+            idx = torch.cat([idx, next_token], dim=1)
+            
+            if level is not None:
+                level = torch.cat([level, level[:, -1:]], dim=1)
+            
+            # Check EOS
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+        
+        return idx
+    
+    def prepare_for_inference(self):
+        """Switch all quantized modules to inference mode."""
+        for block in self.blocks:
+            block.prepare_for_inference()
+    
     def load_pretrained_weights(self, checkpoint_path: str):
         """Load pretrained dense weights and convert to MoE.
 
@@ -401,7 +307,7 @@ class MoEEngramNextConceptTransformer(nn.Module):
         Experts are initialized from dense MLP via k-means.
         """
         ckpt = torch.load(checkpoint_path, map_location='cpu')
-        state_dict = ckpt['model']
+        state_dict = ckpt['model'] if 'model' in ckpt else ckpt
 
         # Load level embedding (compatible: [11, 768])
         if self.wle is not None and 'transformer.wle.weight' in state_dict:
@@ -445,7 +351,7 @@ class MoEEngramNextConceptTransformer(nn.Module):
 
         # Level 0 unigram for generation
         if 'inference' in ckpt and 'level0_unigram' in ckpt['inference']:
-            self.register_buffer('level0_unigram', ckpt['inference']['level0_unigram'].to(self.device))
+            self.register_buffer('level0_unigram', ckpt['inference']['level0_unigram'].to(next(self.parameters()).device))
 
         # Tie heads to codebook (our architecture)
         self._tie_heads_to_codebook()
@@ -456,8 +362,8 @@ class MoEEngramNextConceptTransformer(nn.Module):
         """
         Initialize 64 experts from dense MLP using k-means clustering.
 
-        dense_fc: [3072, 768] - up projection
-        dense_proj: [768, 3072] - down projection
+        dense_fc: [3072, 768] - up projection (hidden=3072, d_model=768)
+        dense_proj: [768, 3072] - down projection (d_model=768, hidden=3072)
 
         This is a fallback if expert checkpoints don't exist.
         """
@@ -471,35 +377,41 @@ class MoEEngramNextConceptTransformer(nn.Module):
         import numpy as np
 
         # For SwiGLU, we need gate, up, down
-        # Original NCM uses standard MLP: x -> fc -> gelu -> proj
-        # We'll split fc into gate and up (both [3072, 768])
-        d_model, hidden = dense_fc.shape[1], dense_fc.shape[0]
-
-        # Combine gate and up as single matrix for clustering
-        # [2 * hidden, d_model]
-        combined = torch.cat([dense_fc, dense_fc], dim=0).numpy()  # duplicate for gate/up init
-
-        # K-means on rows
-        kmeans = KMeans(n_clusters=64, random_state=42, n_init=10)
-        kmeans.fit(combined)
-
-        centroids = torch.from_numpy(kmeans.cluster_centers_).to(dense_fc.dtype)
-
-        # Split centroids into gate and up
-        gate_centroids = centroids[:hidden]  # [64, 768]
-        up_centroids = centroids[hidden:]    # [64, 768]
-        down_centroids = dense_proj.T.numpy()  # [3072, 768]
+        # dense_fc: [hidden=3072, d_model=768] - shared up projection
+        # dense_proj: [d_model=768, hidden=3072] - down projection
+        hidden, d_model = dense_fc.shape[0], dense_fc.shape[1]
+        
+        # For SwiGLU: 64 experts = 32 gate centroids + 32 up centroids
+        # Cluster the up projection weights into 32 clusters for up, 32 for gate
+        from sklearn.cluster import KMeans
+        import numpy as np
+        
+        # Cluster up projection weights into 32 up centroids
+        kmeans_up = KMeans(n_clusters=32, random_state=42, n_init=10)
+        kmeans_up.fit(dense_fc.numpy())
+        up_centroids = torch.from_numpy(kmeans_up.cluster_centers_).to(dense_fc.dtype)  # [32, d_model]
+        
+        # Use different seed for gate centroids
+        kmeans_gate = KMeans(n_clusters=32, random_state=123, n_init=10)
+        kmeans_gate.fit(dense_fc.numpy())
+        gate_centroids = torch.from_numpy(kmeans_gate.cluster_centers_).to(dense_fc.dtype)  # [32, d_model]
+        
+        # Cluster down projection weights into 64 clusters (one per expert)
+        down_centroids = dense_proj.T.numpy()  # [hidden=3072, d_model=768]
         kmeans_down = KMeans(n_clusters=64, random_state=42, n_init=10)
         kmeans_down.fit(down_centroids)
-        down_centroids = torch.from_numpy(kmeans_down.cluster_centers_).to(dense_proj.dtype)  # [64, 768]
-        down_centroids = down_centroids.T  # [768, 64]
+        down_centroids = torch.from_numpy(kmeans_down.cluster_centers_).to(dense_proj.dtype)  # [64, d_model]
+        down_centroids = down_centroids.T  # [d_model=768, 64]
 
         # Save each expert
         pager = self.blocks[layer_idx].mlp.pager
         for e in range(64):
+            # Each expert uses one gate centroid and one up centroid (mod 32)
+            gate_idx = e % 32
+            up_idx = e % 32
             expert_tensors = {
-                "gate": gate_centroids[e].unsqueeze(0).repeat(hidden, 1) + torch.randn(hidden, d_model) * 0.01,
-                "up": up_centroids[e].unsqueeze(0).repeat(hidden, 1) + torch.randn(hidden, d_model) * 0.01,
+                "gate": gate_centroids[gate_idx].unsqueeze(0).repeat(hidden, 1) + torch.randn(hidden, d_model) * 0.01,
+                "up": up_centroids[up_idx].unsqueeze(0).repeat(hidden, 1) + torch.randn(hidden, d_model) * 0.01,
                 "down": down_centroids[:, e].unsqueeze(1).repeat(1, hidden) + torch.randn(d_model, hidden) * 0.01,
             }
             pager.save_expert(layer_idx, e, expert_tensors)

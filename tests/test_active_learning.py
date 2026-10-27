@@ -9,13 +9,23 @@ Validates:
 - Evaluation metrics
 """
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import pytest
 import os
 import sys
 import tempfile
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from training.active_learning import (
+    ActiveLearner,
+    ConversationTurn,
+    PlasticityConfig,
+    PlasticityController,
+    create_active_learner,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

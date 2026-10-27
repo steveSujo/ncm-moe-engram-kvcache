@@ -4,10 +4,11 @@ Inference script for MoE + Engram + KV Cache NCM Generator.
 Loads trained model with paged experts and runs generation.
 """
 
+import argparse
 import os
 import sys
+
 import torch
-import argparse
 from omegaconf import OmegaConf
 
 # Add project root to path
@@ -15,7 +16,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tokenization.vqvae_tokenizer import VQVAETokenizer
 from models.moe_engram_generator import MoEEngramNextConceptTransformer
-from models.moe_block import MoEBlock
 from utils.expert_io import MoEPager
 
 
